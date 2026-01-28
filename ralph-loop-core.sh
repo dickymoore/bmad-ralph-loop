@@ -432,13 +432,19 @@ update_story_status() {
 
 get_story_status() {
     local story_key="$1"
-    yq ".development_status.\"$story_key\"" "$SPRINT_STATUS" 2>/dev/null || echo "unknown"
+    local status
+    status="$(yq -r ".development_status.\"$story_key\"" "$SPRINT_STATUS" 2>/dev/null || echo "unknown")"
+    if [[ -z "$status" || "$status" == "null" ]]; then
+        echo "unknown"
+    else
+        echo "$status"
+    fi
 }
 
 get_pending_stories() {
     # Get all stories with status: backlog or ready-for-dev
     # Filter out epic entries and retrospectives
-    yq '.development_status | to_entries | .[] | select(.value == "backlog" or .value == "ready-for-dev") | select(.key | test("^[0-9]+-[0-9]+")) | .key' "$SPRINT_STATUS" 2>/dev/null
+    yq -r '.development_status | to_entries | .[] | select(.value == "backlog" or .value == "ready-for-dev") | select(.key | test("^[0-9]+-[0-9]+")) | .key' "$SPRINT_STATUS" 2>/dev/null
 }
 
 get_epic_for_story() {
@@ -613,7 +619,7 @@ main() {
         stories=()
         while IFS= read -r line; do
             [[ -n "$line" ]] && stories+=("$line")
-        done < <(yq ".development_status | to_entries | .[] | select(.key | test(\"^${SPECIFIC_EPIC}-\")) | select(.value == \"backlog\" or .value == \"ready-for-dev\" or .value == \"review\") | .key" "$SPRINT_STATUS" 2>/dev/null)
+        done < <(yq -r ".development_status | to_entries | .[] | select(.key | test(\"^${SPECIFIC_EPIC}-\")) | select(.value == \"backlog\" or .value == \"ready-for-dev\" or .value == \"review\") | .key" "$SPRINT_STATUS" 2>/dev/null)
         log INFO "Processing Epic $SPECIFIC_EPIC stories: ${#stories[@]} found"
     else
         stories=()
