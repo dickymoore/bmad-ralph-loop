@@ -669,9 +669,9 @@ main() {
         current_epic="$epic_num"
 
         if process_story "$story"; then
-            ((processed++))
+            processed=$((processed + 1))
         else
-            ((failed++))
+            failed=$((failed + 1))
             log ERROR "Failed to process story: $story"
 
             echo ""
