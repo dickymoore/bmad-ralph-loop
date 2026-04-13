@@ -52,7 +52,7 @@ development_status:
 |--------|-------------|--------------|
 | `backlog` | Story not started | Runs `create-story` workflow |
 | `ready-for-dev` | Story file exists | Runs `dev-story` workflow |
-| `review` | Implementation done | Runs `code-review` workflow |
+| `review` | Implementation done | Runs `code-review`; loops to `ready-for-dev` if follow-up work is needed |
 | `done` | Story completed | Skipped |
 | `blocked` | Story blocked | Skipped |
 | `in-progress` | For epics only | Shows epic is active |
@@ -99,6 +99,17 @@ retrospectives:
 | `RALPH_SPRINT_STATUS` | `_bmad-output/implementation-artifacts/sprint-status.yaml` | Sprint status file path |
 | `RALPH_LOG_DIR` | `logs/` | Directory for log files |
 | `RALPH_SKIP_RETRO` | `false` | Skip retrospective prompt when epics complete |
+| `RALPH_AUTO_RETROSPECTIVE` | `true` | Automatically run retrospective when an epic completes |
+| `RALPH_MAX_REVIEW_PASSES` | `5` | Maximum `dev-story`/`code-review` loops before aborting |
+| `RALPH_PROMPT_ON_FAILURE` | `false` | Prompt before continuing after a story or epic failure |
+| `RALPH_AUTO_PUSH_EPIC` | `true` | Push the current branch when an epic completes |
+| `RALPH_EPIC_PUSH_REMOTE` | *(empty)* | Remote override for automatic epic pushes; defaults to current upstream |
+| `RALPH_CONCURRENCY` | `1` | Number of stories Ralph can process at once |
+| `RALPH_RUNTIME_ROOT` | `../.ralph-runtime/<repo>` | Shared runtime root for parallel worker state |
+| `RALPH_WORKTREE_ROOT` | `$RALPH_RUNTIME_ROOT/worktrees` | Git worktree location for parallel story workers |
+| `RALPH_RESULT_ROOT` | `$RALPH_RUNTIME_ROOT/results` | Worker result files, logs, and console captures |
+| `RALPH_KEEP_WORKTREES_ON_SUCCESS` | `false` | Keep successful worker worktrees instead of deleting them |
+| `RALPH_KEEP_WORKTREES_ON_FAILURE` | `true` | Keep failed worker worktrees for debugging |
 | `RALPH_CODEX_FULL_AUTO` | `true` | Use `--full-auto` with Codex exec |
 | `RALPH_CODEX_SANDBOX` | *(empty)* | Codex sandbox mode (e.g., `danger-full-access`) |
 | `RALPH_CODEX_MODEL` | *(empty)* | Codex model override |
@@ -199,7 +210,8 @@ claude-ralph-loop --skip-review
 The default workflow order is:
 1. `create-story` (backlog → ready-for-dev)
 2. `dev-story` (ready-for-dev → review)
-3. `code-review` (review → done)
+3. `code-review` (review → ready-for-dev for another dev pass, or review → done when clean)
+4. Epic finalization (done stories → retrospective → epic completion commit → push)
 
 To change this, modify the `process_story()` function in the script.
 
@@ -217,10 +229,28 @@ To use custom agents:
 
 ### Parallel Processing
 
-Currently, stories are processed sequentially. For parallel processing, you would need to:
-1. Fork the script
-2. Modify the main loop to use background processes
-3. Handle concurrent YAML updates carefully
+Set `RALPH_CONCURRENCY` to a value greater than `1` to enable Ralph's worktree-based parallel mode.
+
+How it works:
+1. The main Ralph process stays in the authoritative repo and owns the real `sprint-status.yaml`.
+2. Each runnable story gets its own git branch and git worktree under `RALPH_WORKTREE_ROOT`.
+3. Each worker runs Ralph in single-story mode against a copied sprint status file.
+4. The controller waits for workers to finish, then cherry-picks successful worker commits back one at a time.
+5. Only after integration succeeds does the controller update the authoritative story status and check for epic completion.
+
+Parallel mode rules:
+- The main project worktree must be clean except for Ralph `ralph-*.log` files.
+- `RALPH_WORKTREE_ROOT` and `RALPH_RESULT_ROOT` must live outside the project repository.
+- Absolute `story_location` values are supported only when they point inside the project repository; Ralph remaps them into each worker worktree.
+- Stories listed in `dependencies:` will not launch until every dependency is `done`.
+- Parallel mode requires `Bash 4.3+`.
+- If a worker commit fails to integrate, Ralph leaves the authoritative story status unchanged and keeps the worker worktree for manual inspection.
+
+Example:
+
+```bash
+RALPH_CONCURRENCY=3 codex-ralph-loop
+```
 
 ### Custom Commit Messages
 

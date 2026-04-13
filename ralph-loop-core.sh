@@ -33,6 +33,14 @@
 
 set -e
 
+SOURCE_PATH="${BASH_SOURCE[0]}"
+if command -v realpath >/dev/null 2>&1; then
+    SOURCE_PATH="$(realpath "$SOURCE_PATH")"
+elif command -v readlink >/dev/null 2>&1; then
+    SOURCE_PATH="$(readlink -f "$SOURCE_PATH" 2>/dev/null || echo "$SOURCE_PATH")"
+fi
+CORE_SCRIPT_PATH="$SOURCE_PATH"
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -85,6 +93,21 @@ CODEX_FULL_AUTO="${RALPH_CODEX_FULL_AUTO:-true}"
 CODEX_SANDBOX="${RALPH_CODEX_SANDBOX:-}"
 CODEX_MODEL="${RALPH_CODEX_MODEL:-}"
 CODEX_SEARCH="${RALPH_CODEX_SEARCH:-false}"
+AUTO_RETROSPECTIVE="${RALPH_AUTO_RETROSPECTIVE:-true}"
+MAX_REVIEW_PASSES="${RALPH_MAX_REVIEW_PASSES:-5}"
+PROMPT_ON_FAILURE="${RALPH_PROMPT_ON_FAILURE:-false}"
+AUTO_PUSH_EPIC="${RALPH_AUTO_PUSH_EPIC:-true}"
+EPIC_PUSH_REMOTE="${RALPH_EPIC_PUSH_REMOTE:-}"
+CONCURRENCY="${RALPH_CONCURRENCY:-1}"
+WORKER_MODE="${RALPH_WORKER_MODE:-false}"
+WORKER_STORY="${RALPH_WORKER_STORY:-}"
+WORKER_RESULT_FILE="${RALPH_WORKER_RESULT_FILE:-}"
+KEEP_WORKTREES_ON_SUCCESS="${RALPH_KEEP_WORKTREES_ON_SUCCESS:-false}"
+KEEP_WORKTREES_ON_FAILURE="${RALPH_KEEP_WORKTREES_ON_FAILURE:-true}"
+PROJECT_PARENT="$(cd "$PROJECT_ROOT/.." 2>/dev/null && pwd || echo "$PROJECT_ROOT")"
+RUNTIME_ROOT="${RALPH_RUNTIME_ROOT:-$PROJECT_PARENT/.ralph-runtime/$(basename "$PROJECT_ROOT")}"
+WORKTREE_ROOT="${RALPH_WORKTREE_ROOT:-$RUNTIME_ROOT/worktrees}"
+RESULT_ROOT="${RALPH_RESULT_ROOT:-$RUNTIME_ROOT/results}"
 
 # =============================================================================
 # Helper Functions
@@ -164,6 +187,17 @@ usage() {
     echo "  RALPH_SPRINT_STATUS   Path to sprint-status.yaml"
     echo "  RALPH_LOG_DIR         Directory for log files"
     echo "  RALPH_SKIP_RETRO      Skip retrospective prompt (true/false)"
+    echo "  RALPH_AUTO_RETROSPECTIVE Automatically run retrospective on epic completion (default: true)"
+    echo "  RALPH_MAX_REVIEW_PASSES Maximum review/dev loops before aborting (default: 5)"
+    echo "  RALPH_PROMPT_ON_FAILURE Prompt before continuing after failures (default: false)"
+    echo "  RALPH_AUTO_PUSH_EPIC  Push the current branch when an epic completes (default: true)"
+    echo "  RALPH_EPIC_PUSH_REMOTE Remote to use for automatic epic pushes (default: current upstream)"
+    echo "  RALPH_CONCURRENCY     Number of stories to process in parallel (default: 1)"
+    echo "  RALPH_RUNTIME_ROOT    Shared runtime root for parallel worker state"
+    echo "  RALPH_WORKTREE_ROOT   Directory for parallel story worktrees"
+    echo "  RALPH_RESULT_ROOT     Directory for parallel worker result files"
+    echo "  RALPH_KEEP_WORKTREES_ON_SUCCESS Keep successful worker worktrees (default: false)"
+    echo "  RALPH_KEEP_WORKTREES_ON_FAILURE Keep failed worker worktrees (default: true)"
     if [[ "$PROVIDER" == "codex" ]]; then
         echo "  RALPH_CODEX_FULL_AUTO Use --full-auto with codex exec (default: true)"
         echo "  RALPH_CODEX_SANDBOX   Codex sandbox mode (e.g., danger-full-access)"
@@ -272,6 +306,251 @@ check_sprint_status() {
     log OK "Found sprint-status.yaml"
 }
 
+validate_numeric_setting() {
+    local name="$1"
+    local value="$2"
+
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        log ERROR "$name must be a non-negative integer (got: $value)"
+        exit 1
+    fi
+}
+
+bash_supports_parallel_mode() {
+    if [[ "${BASH_VERSINFO[0]}" -gt 4 ]]; then
+        return 0
+    fi
+
+    if [[ "${BASH_VERSINFO[0]}" -eq 4 && "${BASH_VERSINFO[1]}" -ge 3 ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+resolve_absolute_path() {
+    local path="$1"
+
+    if [[ "$path" != /* ]]; then
+        path="$PROJECT_ROOT/$path"
+    fi
+
+    if command -v realpath >/dev/null 2>&1; then
+        realpath "$path" 2>/dev/null && return 0
+    fi
+
+    if command -v readlink >/dev/null 2>&1; then
+        readlink -f "$path" 2>/dev/null && return 0
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$path" 2>/dev/null && return 0
+    fi
+
+    if command -v python >/dev/null 2>&1; then
+        python -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$path" 2>/dev/null && return 0
+    fi
+
+    echo "$path"
+}
+
+get_repo_relative_path() {
+    local path="$1"
+    local resolved_path=""
+    local resolved_project_root=""
+
+    resolved_path="$(resolve_absolute_path "$path")"
+    resolved_project_root="$(resolve_absolute_path "$PROJECT_ROOT")"
+
+    case "$resolved_path/" in
+        "$resolved_project_root/"*|"$resolved_project_root/")
+            if [[ "$resolved_path" == "$resolved_project_root" ]]; then
+                echo "."
+            else
+                echo "${resolved_path#$resolved_project_root/}"
+            fi
+            ;;
+    esac
+}
+
+ensure_parallel_runtime_outside_repo() {
+    local resolved_project_root=""
+    local resolved_worktree_root=""
+    local resolved_result_root=""
+
+    resolved_project_root="$(resolve_absolute_path "$PROJECT_ROOT")"
+    resolved_worktree_root="$(resolve_absolute_path "$WORKTREE_ROOT")"
+    resolved_result_root="$(resolve_absolute_path "$RESULT_ROOT")"
+
+    case "$resolved_worktree_root/" in
+        "$resolved_project_root/"*|"$resolved_project_root/")
+            log ERROR "RALPH_WORKTREE_ROOT must be outside the project repository in parallel mode."
+            exit 1
+            ;;
+    esac
+
+    case "$resolved_result_root/" in
+        "$resolved_project_root/"*|"$resolved_project_root/")
+            log ERROR "RALPH_RESULT_ROOT must be outside the project repository in parallel mode."
+            exit 1
+            ;;
+    esac
+}
+
+count_entries() {
+    local count=0
+    local _
+
+    for _ in "$@"; do
+        count=$((count + 1))
+    done
+
+    echo "$count"
+}
+
+parallel_mode_enabled() {
+    if [[ "$WORKER_MODE" == "true" ]]; then
+        return 1
+    fi
+
+    if [[ -n "$SPECIFIC_STORY" ]]; then
+        return 1
+    fi
+
+    if [[ "$CONCURRENCY" -le 1 ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
+ensure_parallel_safe_worktree() {
+    local non_log_changes=""
+
+    non_log_changes="$(git -C "$PROJECT_ROOT" status --porcelain 2>/dev/null | grep -Ev '^[ MARCUD?]{2} (logs/ralph-[0-9]{8}-[0-9]{6}\.log|\.codex)$' || true)"
+
+    if [[ -n "$non_log_changes" ]]; then
+        log ERROR "Parallel mode requires a clean project worktree except for Ralph logs."
+        log ERROR "Clean or commit these changes before using RALPH_CONCURRENCY>1:"
+        printf '%s\n' "$non_log_changes"
+        exit 1
+    fi
+}
+
+prepare_parallel_runtime() {
+    ensure_parallel_runtime_outside_repo
+    mkdir -p "$WORKTREE_ROOT" "$RESULT_ROOT"
+}
+
+prepare_worker_sprint_status() {
+    local worker_sprint_status="$1"
+    local worktree_dir="$2"
+    local configured_story_location=""
+    local resolved_story_location=""
+    local resolved_project_root=""
+    local worker_story_location=""
+
+    configured_story_location="$(yq -r '.story_location // ""' "$worker_sprint_status" 2>/dev/null || true)"
+
+    if [[ -z "$configured_story_location" || "$configured_story_location" == "null" ]]; then
+        return 0
+    fi
+
+    if [[ "$configured_story_location" != /* ]]; then
+        return 0
+    fi
+
+    resolved_story_location="$(resolve_absolute_path "$configured_story_location")"
+    resolved_project_root="$(resolve_absolute_path "$PROJECT_ROOT")"
+
+    case "$resolved_story_location/" in
+        "$resolved_project_root/"*|"$resolved_project_root/")
+            worker_story_location="$worktree_dir${resolved_story_location#$resolved_project_root}"
+            yq -yi ".story_location = \"$worker_story_location\"" "$worker_sprint_status"
+            return 0
+            ;;
+    esac
+
+    log ERROR "Parallel mode requires story_location to be relative or under the project root (got: $configured_story_location)"
+    return 1
+}
+
+get_story_dependencies() {
+    local story_key="$1"
+
+    yq -r ".dependencies.\"$story_key\"[]?" "$SPRINT_STATUS" 2>/dev/null || true
+}
+
+story_dependencies_satisfied() {
+    local story_key="$1"
+    local dependency=""
+    local dependency_status=""
+
+    while IFS= read -r dependency; do
+        [[ -z "$dependency" ]] && continue
+        dependency_status="$(get_story_status "$dependency")"
+        if [[ "$dependency_status" != "done" ]]; then
+            return 1
+        fi
+    done < <(get_story_dependencies "$story_key")
+
+    return 0
+}
+
+mark_epic_in_progress_for_story() {
+    local story_key="$1"
+    local epic_num=""
+    local epic_key=""
+    local epic_status=""
+
+    epic_num="$(get_epic_for_story "$story_key")"
+    epic_key="epic-$epic_num"
+    epic_status="$(get_story_status "$epic_key")"
+
+    if [[ "$epic_status" == "backlog" ]]; then
+        update_story_status "$epic_key" "in-progress"
+    fi
+}
+
+write_worker_result() {
+    local result_file="$1"
+    local result_status="$2"
+    local story_key="$3"
+    local branch_name="$4"
+    local worktree_dir="$5"
+    local exit_code="$6"
+    local commit_sha="${7:-}"
+    local worker_log_file="${8:-}"
+
+    mkdir -p "$(dirname "$result_file")"
+
+    {
+        printf 'RALPH_WORKER_RESULT_STATUS=%q\n' "$result_status"
+        printf 'RALPH_WORKER_RESULT_STORY=%q\n' "$story_key"
+        printf 'RALPH_WORKER_RESULT_BRANCH=%q\n' "$branch_name"
+        printf 'RALPH_WORKER_RESULT_WORKTREE=%q\n' "$worktree_dir"
+        printf 'RALPH_WORKER_RESULT_EXIT_CODE=%q\n' "$exit_code"
+        printf 'RALPH_WORKER_RESULT_COMMIT_SHA=%q\n' "$commit_sha"
+        printf 'RALPH_WORKER_RESULT_LOG_FILE=%q\n' "$worker_log_file"
+    } > "$result_file"
+}
+
+cleanup_worker_checkout() {
+    local branch_name="$1"
+    local worktree_dir="$2"
+    local keep_checkout="$3"
+
+    if [[ "$keep_checkout" == "true" ]]; then
+        log INFO "Keeping worker worktree: $worktree_dir"
+        return 0
+    fi
+
+    git -C "$PROJECT_ROOT" worktree remove --force "$worktree_dir" >/dev/null 2>&1 || true
+    if [[ -n "$branch_name" ]]; then
+        git -C "$PROJECT_ROOT" branch -D "$branch_name" >/dev/null 2>&1 || true
+    fi
+}
+
 # =============================================================================
 # Core Functions
 # =============================================================================
@@ -281,6 +560,7 @@ run_agent_workflow() {
     local workflow="$2"
     local description="$3"
     local extra_context="${4:-}"
+    local capture_file="${5:-}"
 
     log STEP "[$agent] Running: $workflow"
     log INFO "Description: $description"
@@ -295,17 +575,43 @@ run_agent_workflow() {
 
 CRITICAL: Run in fully autonomous mode. Do NOT ask questions or wait for user input. Auto-fix any issues found. Choose reasonable defaults when options are presented. Complete the entire workflow without stopping for confirmations."
 
+    if [[ "$workflow" == "code-review" ]]; then
+        prompt="$prompt
+
+REVIEW LOOP CONTRACT:
+- If review is clean and no additional implementation work is needed, print exactly: RALPH_REVIEW_RESULT=clean
+- If review finds issues that need another dev pass, or if you make repository changes during review, print exactly: RALPH_REVIEW_RESULT=changes-required
+- The RALPH_REVIEW_RESULT line must be the final line of your response."
+    fi
+
     local exit_code=0
 
     # Run provider with the workflow
     case "$PROVIDER" in
         claude)
-            if [[ "$VERBOSE" == "true" ]]; then
-                claude --print --dangerously-skip-permissions "$prompt" 2>&1 | tee -a "$LOG_FILE"
-            else
-                claude --print --dangerously-skip-permissions "$prompt" >> "$LOG_FILE" 2>&1
+            if [[ -n "$capture_file" ]]; then
+                : > "$capture_file"
             fi
-            exit_code=$?
+
+            if [[ "$VERBOSE" == "true" || -n "$capture_file" ]]; then
+                local tee_args=("-a" "$LOG_FILE")
+                if [[ -n "$capture_file" ]]; then
+                    tee_args+=("$capture_file")
+                fi
+
+                if [[ "$VERBOSE" == "true" ]]; then
+                    claude --print --dangerously-skip-permissions "$prompt" 2>&1 | tee "${tee_args[@]}"
+                else
+                    claude --print --dangerously-skip-permissions "$prompt" 2>&1 | tee "${tee_args[@]}" >/dev/null
+                fi
+                exit_code=${PIPESTATUS[0]}
+            else
+                if claude --print --dangerously-skip-permissions "$prompt" >> "$LOG_FILE" 2>&1; then
+                    exit_code=0
+                else
+                    exit_code=$?
+                fi
+            fi
             ;;
         codex)
             local codex_args=("exec")
@@ -326,12 +632,29 @@ CRITICAL: Run in fully autonomous mode. Do NOT ask questions or wait for user in
                 codex_args+=("--model" "$CODEX_MODEL")
             fi
 
-            if [[ "$VERBOSE" == "true" ]]; then
-                codex "${codex_args[@]}" "$prompt" 2>&1 | tee -a "$LOG_FILE"
-            else
-                codex "${codex_args[@]}" "$prompt" >> "$LOG_FILE" 2>&1
+            if [[ -n "$capture_file" ]]; then
+                : > "$capture_file"
             fi
-            exit_code=$?
+
+            if [[ "$VERBOSE" == "true" || -n "$capture_file" ]]; then
+                local tee_args=("-a" "$LOG_FILE")
+                if [[ -n "$capture_file" ]]; then
+                    tee_args+=("$capture_file")
+                fi
+
+                if [[ "$VERBOSE" == "true" ]]; then
+                    codex "${codex_args[@]}" "$prompt" 2>&1 | tee "${tee_args[@]}"
+                else
+                    codex "${codex_args[@]}" "$prompt" 2>&1 | tee "${tee_args[@]}" >/dev/null
+                fi
+                exit_code=${PIPESTATUS[0]}
+            else
+                if codex "${codex_args[@]}" "$prompt" >> "$LOG_FILE" 2>&1; then
+                    exit_code=0
+                else
+                    exit_code=$?
+                fi
+            fi
             ;;
     esac
 
@@ -345,7 +668,8 @@ CRITICAL: Run in fully autonomous mode. Do NOT ask questions or wait for user in
 
 verify_story_file_created() {
     local story_key="$1"
-    local story_file="$IMPLEMENTATION_ARTIFACTS/${story_key}.md"
+    local story_file
+    story_file="$(get_story_file_path "$story_key")"
 
     if [[ -f "$story_file" ]]; then
         log OK "Story file verified: $story_file"
@@ -355,6 +679,118 @@ verify_story_file_created() {
         log ERROR "create-story workflow failed silently!"
         return 1
     fi
+}
+
+get_story_directory() {
+    local configured_path=""
+
+    configured_path="$(yq -r '.story_location // ""' "$SPRINT_STATUS" 2>/dev/null || true)"
+
+    if [[ -z "$configured_path" || "$configured_path" == "null" ]]; then
+        echo "$IMPLEMENTATION_ARTIFACTS"
+    elif [[ "$configured_path" = /* ]]; then
+        echo "$configured_path"
+    else
+        echo "$PROJECT_ROOT/$configured_path"
+    fi
+}
+
+get_story_file_path() {
+    local story_key="$1"
+    local story_dir
+    story_dir="$(get_story_directory)"
+    echo "$story_dir/${story_key}.md"
+}
+
+hash_stream() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | awk '{print $1}'
+    else
+        shasum -a 256 | awk '{print $1}'
+    fi
+}
+
+capture_worktree_fingerprint() {
+    (
+        cd "$PROJECT_ROOT"
+
+        {
+            git status --porcelain=v1 2>/dev/null
+            git diff --no-ext-diff --binary 2>/dev/null
+            git diff --no-ext-diff --cached --binary 2>/dev/null
+
+            while IFS= read -r -d '' file; do
+                local file_hash=""
+                if [[ -f "$file" ]]; then
+                    file_hash="$(hash_stream < "$file")"
+                else
+                    file_hash="missing"
+                fi
+                printf 'UNTRACKED %s %s\n' "$file_hash" "$file"
+            done < <(git ls-files --others --exclude-standard -z 2>/dev/null)
+        } | hash_stream
+    )
+}
+
+extract_review_result() {
+    local capture_file="$1"
+    local review_result=""
+
+    review_result="$(grep -Eo 'RALPH_REVIEW_RESULT=(clean|changes-required)' "$capture_file" | tail -n 1 | cut -d'=' -f2 || true)"
+
+    case "$review_result" in
+        clean|changes-required)
+            echo "$review_result"
+            ;;
+    esac
+}
+
+code_review_requires_dev() {
+    local story_key="$1"
+    local review_pass="$2"
+    local before_fingerprint=""
+    local after_fingerprint=""
+    local review_capture=""
+    local review_result=""
+
+    before_fingerprint="$(capture_worktree_fingerprint)"
+    review_capture="$(mktemp "${TMPDIR:-/tmp}/ralph-review-${story_key}-${review_pass}.XXXXXX")"
+
+    if ! run_agent_workflow "DEV" "code-review" "Review implementation for story $story_key" "Review the changes made for story $story_key. Follow the review loop contract so Ralph can decide whether to run dev-story again." "$review_capture"; then
+        rm -f "$review_capture"
+        return 2
+    fi
+
+    after_fingerprint="$(capture_worktree_fingerprint)"
+    review_result="$(extract_review_result "$review_capture")"
+    rm -f "$review_capture"
+
+    if [[ "$before_fingerprint" != "$after_fingerprint" ]]; then
+        if [[ "$review_result" == "clean" ]]; then
+            log WARN "Code review pass $review_pass reported clean but changed the worktree. Re-running dev-story."
+            return 0
+        fi
+
+        if [[ -z "$review_result" ]]; then
+            log WARN "Code review pass $review_pass changed the worktree without emitting RALPH_REVIEW_RESULT. Re-running dev-story."
+        else
+            log WARN "Code review pass $review_pass requested another dev pass."
+        fi
+        return 0
+    fi
+
+    if [[ "$review_result" == "changes-required" ]]; then
+        log WARN "Code review pass $review_pass requested another dev pass."
+        return 0
+    fi
+
+    if [[ -z "$review_result" ]]; then
+        log WARN "Code review pass $review_pass did not emit RALPH_REVIEW_RESULT. Assuming review is clean because the worktree did not change."
+    else
+        log OK "Code review pass $review_pass finished cleanly."
+    fi
+
+    return 1
 }
 
 verify_implementation() {
@@ -372,45 +808,236 @@ verify_implementation() {
     fi
 }
 
-commit_story_changes() {
-    local story_key="$1"
-    local epic_num="$2"
+should_continue_after_failure() {
+    local prompt_text="$1"
 
-    log STEP "Committing changes for $story_key..."
+    if [[ "$PROMPT_ON_FAILURE" != "true" ]]; then
+        log WARN "Failure encountered. Continuing automatically (RALPH_PROMPT_ON_FAILURE=false)."
+        return 0
+    fi
+
+    echo ""
+    read -p "$prompt_text [Y/n]: " continue_choice
+    if [[ "$continue_choice" =~ ^[Nn] ]]; then
+        return 1
+    fi
+
+    return 0
+}
+
+unstage_paths() {
+    local reason="$1"
+    shift
+    local paths=("$@")
+
+    if [[ ${#paths[@]} -eq 0 ]]; then
+        return 0
+    fi
+
+    if git reset -q HEAD -- "${paths[@]}" 2>/dev/null; then
+        log INFO "Excluded $reason from commit: ${#paths[@]} file(s)"
+        return 0
+    fi
+
+    if git restore --staged -- "${paths[@]}" >/dev/null 2>&1; then
+        log INFO "Excluded $reason from commit: ${#paths[@]} file(s)"
+        return 0
+    fi
+
+    log ERROR "Failed to exclude $reason from commit staging"
+    return 1
+}
+
+unstage_paths_matching_regex() {
+    local reason="$1"
+    local regex="$2"
+    local matches=()
+    local path=""
+
+    while IFS= read -r -d '' path; do
+        if [[ "$path" =~ $regex ]]; then
+            matches+=("$path")
+        fi
+    done < <(git diff --cached --name-only -z 2>/dev/null)
+
+    unstage_paths "$reason" "${matches[@]}"
+}
+
+unstage_ralph_logs() {
+    unstage_paths_matching_regex "Ralph logs" '(^|/)ralph-[0-9]{8}-[0-9]{6}\.log$'
+}
+
+unstage_codex_runtime_files() {
+    unstage_paths_matching_regex "Codex runtime files" '(^|/)\.codex$'
+}
+
+unstage_worker_commit_noise() {
+    local story_dir_rel=""
+    local current_story_rel=""
+    local repo_sprint_status_rel=""
+    local path=""
+    local base=""
+    local exclusions=()
+
+    if [[ "$WORKER_MODE" != "true" || -z "$SPECIFIC_STORY" ]]; then
+        return 0
+    fi
+
+    story_dir_rel="$(get_repo_relative_path "$(get_story_directory)")"
+    current_story_rel="$(get_repo_relative_path "$(get_story_file_path "$SPECIFIC_STORY")")"
+    repo_sprint_status_rel="$(get_repo_relative_path "$IMPLEMENTATION_ARTIFACTS/sprint-status.yaml")"
+
+    while IFS= read -r -d '' path; do
+        if [[ -n "$repo_sprint_status_rel" && "$path" == "$repo_sprint_status_rel" ]]; then
+            exclusions+=("$path")
+            continue
+        fi
+
+        if [[ -n "$story_dir_rel" && "$path" == "$story_dir_rel/"*.md ]]; then
+            base="${path##*/}"
+            if [[ "$base" =~ ^[0-9]+-[0-9]+.*\.md$ && "$path" != "$current_story_rel" ]]; then
+                exclusions+=("$path")
+            fi
+        fi
+    done < <(git diff --cached --name-only -z 2>/dev/null)
+
+    unstage_paths "worker-only story metadata" "${exclusions[@]}"
+}
+
+summarize_staged_files() {
+    git diff --cached --name-only 2>/dev/null | head -10 | tr '\n' ', ' | sed 's/,$//'
+}
+
+commit_changes() {
+    local subject="$1"
+    local label="$2"
+    local dry_run_description="$3"
+    local modified_files=""
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log WARN "[DRY-RUN] Would commit changes for $story_key"
+        log WARN "[DRY-RUN] Would commit $dry_run_description"
         return 0
     fi
 
     cd "$PROJECT_ROOT"
 
-    # Get list of modified files for commit message
-    local modified_files=$(git status --porcelain 2>/dev/null | grep -E '^[AM\?]' | awk '{print $2}' | head -10 | tr '\n' ', ' | sed 's/,$//')
-
-    # Add all modified/new files
     git add -A
 
-    # Check if there are changes to commit
+    if ! unstage_ralph_logs; then
+        return 1
+    fi
+
+    if ! unstage_codex_runtime_files; then
+        return 1
+    fi
+
+    if ! unstage_worker_commit_noise; then
+        return 1
+    fi
+
+    modified_files="$(summarize_staged_files)"
+
     if git diff --cached --quiet; then
-        log WARN "No changes to commit for $story_key"
+        log WARN "No changes to commit for $label"
         return 0
     fi
 
-    # Create commit with story info
-    git commit -m "$(cat <<EOF
-feat(epic-$epic_num): implement $story_key
+    if git commit -m "$(cat <<EOF
+$subject
 
 Files: $modified_files
 EOF
-)"
-
-    if [[ $? -eq 0 ]]; then
-        log OK "Committed: $story_key"
+)"; then
+        log OK "Committed: $label"
     else
-        log ERROR "Commit failed for $story_key"
+        log ERROR "Commit failed for $label"
         return 1
     fi
+}
+
+commit_story_changes() {
+    local story_key="$1"
+    local epic_num="$2"
+
+    log STEP "Committing changes for $story_key..."
+    commit_changes "feat(epic-$epic_num): implement $story_key" "$story_key" "changes for $story_key"
+}
+
+commit_epic_changes() {
+    local epic_num="$1"
+    local epic_key="epic-$epic_num"
+
+    log STEP "Committing epic completion changes for $epic_key..."
+    commit_changes "chore(epic-$epic_num): complete $epic_key" "$epic_key" "epic completion for $epic_key"
+}
+
+push_epic_changes() {
+    local epic_num="$1"
+    local epic_key="epic-$epic_num"
+    local current_branch=""
+    local configured_remote="$EPIC_PUSH_REMOTE"
+    local remotes=()
+
+    if [[ "$AUTO_PUSH_EPIC" != "true" ]]; then
+        log INFO "Skipping automatic push for $epic_key (RALPH_AUTO_PUSH_EPIC=false)"
+        return 0
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log WARN "[DRY-RUN] Would push changes for $epic_key"
+        return 0
+    fi
+
+    cd "$PROJECT_ROOT"
+
+    current_branch="$(git branch --show-current 2>/dev/null || true)"
+    if [[ -z "$current_branch" ]]; then
+        log WARN "Skipping automatic push for $epic_key: current branch could not be determined"
+        return 0
+    fi
+
+    if [[ -n "$configured_remote" ]]; then
+        if ! git remote get-url "$configured_remote" >/dev/null 2>&1; then
+            log ERROR "Configured epic push remote not found: $configured_remote"
+            return 1
+        fi
+
+        if git push -u "$configured_remote" "$current_branch"; then
+            log OK "Pushed $epic_key to $configured_remote/$current_branch"
+            return 0
+        fi
+
+        log ERROR "Push failed for $epic_key via $configured_remote/$current_branch"
+        return 1
+    fi
+
+    if git rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+        if git push; then
+            log OK "Pushed $epic_key to the configured upstream branch"
+            return 0
+        fi
+
+        log ERROR "Push failed for $epic_key via the configured upstream branch"
+        return 1
+    fi
+
+    while IFS= read -r remote_name; do
+        [[ -n "$remote_name" ]] && remotes+=("$remote_name")
+    done < <(git remote)
+
+    if [[ ${#remotes[@]} -eq 1 ]]; then
+        log WARN "No upstream branch configured. Pushing $epic_key to ${remotes[0]}/$current_branch."
+        if git push -u "${remotes[0]}" "$current_branch"; then
+            log OK "Pushed $epic_key to ${remotes[0]}/$current_branch"
+            return 0
+        fi
+
+        log ERROR "Push failed for $epic_key via ${remotes[0]}/$current_branch"
+        return 1
+    fi
+
+    log WARN "Skipping automatic push for $epic_key: no upstream branch configured and remote target is ambiguous"
+    return 0
 }
 
 update_story_status() {
@@ -425,7 +1052,7 @@ update_story_status() {
     fi
 
     # Use yq to update the YAML file
-    yq -i ".development_status.\"$story_key\" = \"$new_status\"" "$SPRINT_STATUS"
+    yq -yi ".development_status.\"$story_key\" = \"$new_status\"" "$SPRINT_STATUS"
 
     log OK "Status updated: $story_key = $new_status"
 }
@@ -442,9 +1069,9 @@ get_story_status() {
 }
 
 get_pending_stories() {
-    # Get all stories with status: backlog or ready-for-dev
+    # Get all stories with status: backlog, ready-for-dev, or review
     # Filter out epic entries and retrospectives
-    yq -r '.development_status | to_entries | .[] | select(.value == "backlog" or .value == "ready-for-dev") | select(.key | test("^[0-9]+-[0-9]+")) | .key' "$SPRINT_STATUS" 2>/dev/null
+    yq -r '.development_status | to_entries | .[] | select(.value == "backlog" or .value == "ready-for-dev" or .value == "review") | select(.key | test("^[0-9]+-[0-9]+")) | .key' "$SPRINT_STATUS" 2>/dev/null
 }
 
 get_epic_for_story() {
@@ -457,6 +1084,7 @@ process_story() {
     local story_key="$1"
     local epic_num=$(get_epic_for_story "$story_key")
     local current_status=$(get_story_status "$story_key")
+    local review_pass=0
 
     echo ""
     echo -e "${CYAN}============================================================${NC}"
@@ -476,40 +1104,85 @@ process_story() {
         log STEP "[1/3] Creating story file..."
         run_agent_workflow "SM" "create-story" "Create story file for $story_key" "The story to create is $story_key from Epic $epic_num."
 
-        # Verify story file was actually created
-        if ! verify_story_file_created "$story_key"; then
-            log ERROR "Aborting: Story file verification failed for $story_key"
-            return 1
-        fi
+        if [[ "$DRY_RUN" == "true" ]]; then
+            log INFO "[1/3] Dry run: skipping story file verification and status update"
+            current_status="ready-for-dev"
+        else
+            # Verify story file was actually created
+            if ! verify_story_file_created "$story_key"; then
+                log ERROR "Aborting: Story file verification failed for $story_key"
+                return 1
+            fi
 
-        update_story_status "$story_key" "ready-for-dev"
-        current_status="ready-for-dev"
+            update_story_status "$story_key" "ready-for-dev"
+            current_status="ready-for-dev"
+        fi
     else
         log INFO "[1/3] Story file already exists, skipping create-story"
     fi
 
-    # Step 2: Implement Story (DEV agent)
-    if [[ "$current_status" == "ready-for-dev" ]]; then
-        log STEP "[2/3] Implementing story..."
-        run_agent_workflow "DEV" "dev-story" "Implement story $story_key" "The story to implement is $story_key."
+    while true; do
+        # Step 2: Implement Story (DEV agent)
+        if [[ "$current_status" == "ready-for-dev" ]]; then
+            if [[ "$review_pass" -gt 0 ]]; then
+                log INFO "Re-entering dev-story after code review feedback (next pass: $((review_pass + 1)))"
+            fi
+            log STEP "[2/3] Implementing story..."
+            run_agent_workflow "DEV" "dev-story" "Implement story $story_key" "The story to implement is $story_key."
 
-        verify_implementation "$story_key"
+            verify_implementation "$story_key"
 
-        update_story_status "$story_key" "review"
-        current_status="review"
-    else
-        log INFO "[2/3] Story already implemented, skipping dev-story"
-    fi
+            update_story_status "$story_key" "review"
+            current_status="review"
+        else
+            log INFO "[2/3] Story already implemented, skipping dev-story"
+        fi
 
-    # Step 3: Code Review (DEV agent)
-    if [[ "$current_status" == "review" && "$SKIP_CODE_REVIEW" == "false" ]]; then
-        log STEP "[3/3] Running code review..."
-        run_agent_workflow "DEV" "code-review" "Review implementation for story $story_key" "Review the changes made for story $story_key."
-        update_story_status "$story_key" "done"
-    elif [[ "$SKIP_CODE_REVIEW" == "true" ]]; then
-        log WARN "[3/3] Skipping code review (--skip-review flag)"
-        update_story_status "$story_key" "done"
-    fi
+        # Step 3: Code Review (DEV agent)
+        if [[ "$current_status" == "review" && "$SKIP_CODE_REVIEW" == "false" ]]; then
+            local review_outcome=0
+            review_pass=$((review_pass + 1))
+            if [[ "$review_pass" -gt "$MAX_REVIEW_PASSES" ]]; then
+                log ERROR "Review loop exceeded $MAX_REVIEW_PASSES pass(es) for $story_key"
+                log ERROR "Inspect the workflow output or raise RALPH_MAX_REVIEW_PASSES if the loop is intentional."
+                return 1
+            fi
+
+            log STEP "[3/3] Running code review (pass $review_pass/$MAX_REVIEW_PASSES)..."
+            if code_review_requires_dev "$story_key" "$review_pass"; then
+                review_outcome=0
+            else
+                review_outcome=$?
+            fi
+
+            case "$review_outcome" in
+                0)
+                    update_story_status "$story_key" "ready-for-dev"
+                    current_status="ready-for-dev"
+                    continue
+                    ;;
+                1)
+                    update_story_status "$story_key" "done"
+                    current_status="done"
+                    ;;
+                *)
+                    log ERROR "Aborting: code review failed for $story_key"
+                    return 1
+                    ;;
+            esac
+        elif [[ "$current_status" == "review" && "$SKIP_CODE_REVIEW" == "true" ]]; then
+            log WARN "[3/3] Skipping code review (--skip-review flag)"
+            update_story_status "$story_key" "done"
+            current_status="done"
+        fi
+
+        if [[ "$current_status" == "done" ]]; then
+            break
+        fi
+
+        log ERROR "Unexpected story status after processing: $current_status"
+        return 1
+    done
 
     # Step 4: Commit changes
     commit_story_changes "$story_key" "$epic_num"
@@ -521,29 +1194,400 @@ process_story() {
 check_epic_completion() {
     local epic_num="$1"
     local epic_key="epic-$epic_num"
+    local epic_status
+    local retrospective_key="${epic_key}-retrospective"
+    local retrospective_status
 
     # Count stories in this epic that are not done
     local pending=$(yq ".development_status | to_entries | .[] | select(.key | test(\"^${epic_num}-\")) | select(.value != \"done\") | .key" "$SPRINT_STATUS" 2>/dev/null | wc -l)
 
     if [[ "$pending" -eq 0 ]]; then
+        epic_status="$(get_story_status "$epic_key")"
+        retrospective_status="$(get_story_status "$retrospective_key")"
+
+        if [[ "$epic_status" == "done" && ( "$SKIP_RETRO" == "true" || "$AUTO_RETROSPECTIVE" != "true" || "$retrospective_status" == "done" ) ]]; then
+            log INFO "Epic $epic_num is already finalized"
+            return 0
+        fi
+
         log OK "Epic $epic_num completed! All stories are done."
         update_story_status "$epic_key" "done"
 
         if [[ "$SKIP_RETRO" == "true" ]]; then
-            log INFO "Skipping retrospective prompt (--skip-retro)"
-            return 0
-        fi
-
-        # Prompt for retrospective
-        echo ""
-        echo -e "${YELLOW}Would you like to run the retrospective for Epic $epic_num?${NC}"
-        read -p "[y/N]: " run_retro
-
-        if [[ "$run_retro" =~ ^[Yy] ]]; then
+            log INFO "Skipping retrospective (--skip-retro)"
+        elif [[ "$AUTO_RETROSPECTIVE" == "true" ]]; then
+            log INFO "Running retrospective automatically for Epic $epic_num"
             run_agent_workflow "SM" "retrospective" "Run retrospective for Epic $epic_num"
             update_story_status "${epic_key}-retrospective" "done"
+        else
+            log INFO "Skipping retrospective for Epic $epic_num (RALPH_AUTO_RETROSPECTIVE=false)"
+        fi
+
+        commit_epic_changes "$epic_num"
+        push_epic_changes "$epic_num"
+    fi
+}
+
+worker_main() {
+    local story_key="$SPECIFIC_STORY"
+    local branch_name="${RALPH_WORKER_BRANCH:-}"
+    local worktree_dir="${RALPH_WORKER_WORKTREE:-$PROJECT_ROOT}"
+    local result_file="$WORKER_RESULT_FILE"
+    local worker_exit_code=0
+    local starting_head=""
+    local ending_head=""
+    local commit_sha=""
+
+    normalize_provider
+    validate_provider
+    mkdir -p "$LOG_DIR"
+
+    if [[ -z "$story_key" ]]; then
+        log ERROR "Worker mode requires a specific story"
+        return 1
+    fi
+
+    if [[ -z "$result_file" ]]; then
+        log ERROR "Worker mode requires RALPH_WORKER_RESULT_FILE"
+        return 1
+    fi
+
+    log INFO "Worker story: $story_key"
+    log INFO "Worker branch: ${branch_name:-unknown}"
+    log INFO "Worker worktree: $worktree_dir"
+
+    check_dependencies
+    check_sprint_status
+    starting_head="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || true)"
+
+    if process_story "$story_key"; then
+        ending_head="$(git -C "$PROJECT_ROOT" rev-parse HEAD 2>/dev/null || true)"
+        if [[ -n "$ending_head" && "$ending_head" != "$starting_head" ]]; then
+            commit_sha="$ending_head"
+        fi
+        write_worker_result "$result_file" "success" "$story_key" "$branch_name" "$worktree_dir" "0" "$commit_sha" "$LOG_FILE"
+        return 0
+    else
+        worker_exit_code=$?
+        write_worker_result "$result_file" "failed" "$story_key" "$branch_name" "$worktree_dir" "$worker_exit_code" "" "$LOG_FILE"
+        return "$worker_exit_code"
+    fi
+}
+
+launch_story_worker() {
+    local story_key="$1"
+    local launch_id=""
+    local branch_name=""
+    local worktree_dir=""
+    local result_dir=""
+    local result_file=""
+    local worker_log_dir=""
+    local worker_console_log=""
+    local worker_args=()
+    local worker_pid=0
+
+    launch_id="$(date +%Y%m%d-%H%M%S)-$$-$RANDOM"
+    branch_name="ralph/${story_key}-${launch_id}"
+    worktree_dir="$WORKTREE_ROOT/${story_key}-${launch_id}"
+    result_dir="$RESULT_ROOT/${story_key}-${launch_id}"
+    result_file="$result_dir/result.env"
+    worker_log_dir="$result_dir/logs"
+    worker_console_log="$result_dir/worker-console.log"
+
+    mkdir -p "$result_dir" "$worker_log_dir"
+    cp "$SPRINT_STATUS" "$result_dir/sprint-status.yaml"
+
+    if git -C "$PROJECT_ROOT" worktree add -b "$branch_name" "$worktree_dir" HEAD >/dev/null 2>&1; then
+        :
+    else
+        log ERROR "Failed to create worker worktree for $story_key"
+        return 1
+    fi
+
+    if ! prepare_worker_sprint_status "$result_dir/sprint-status.yaml" "$worktree_dir"; then
+        cleanup_worker_checkout "$branch_name" "$worktree_dir" "false"
+        return 1
+    fi
+
+    worker_args=("--story" "$story_key")
+    if [[ "$SKIP_CODE_REVIEW" == "true" ]]; then
+        worker_args+=("--skip-review")
+    fi
+    if [[ "$VERBOSE" == "true" ]]; then
+        worker_args+=("--verbose")
+    fi
+
+    (
+        cd "$worktree_dir"
+        export PROVIDER="$PROVIDER"
+        export RALPH_PROJECT_ROOT="$worktree_dir"
+        export RALPH_SPRINT_STATUS="$result_dir/sprint-status.yaml"
+        export RALPH_LOG_DIR="$worker_log_dir"
+        export RALPH_WORKER_MODE=true
+        export RALPH_WORKER_STORY="$story_key"
+        export RALPH_WORKER_BRANCH="$branch_name"
+        export RALPH_WORKER_WORKTREE="$worktree_dir"
+        export RALPH_WORKER_RESULT_FILE="$result_file"
+        export RALPH_CONCURRENCY=1
+        export RALPH_AUTO_PUSH_EPIC=false
+        bash "$CORE_SCRIPT_PATH" "${worker_args[@]}"
+    ) >"$worker_console_log" 2>&1 &
+    worker_pid=$!
+
+    log INFO "Launched worker for $story_key on branch $branch_name (pid: $worker_pid)"
+
+    LAUNCHED_WORKER_PID="$worker_pid"
+    LAUNCHED_WORKER_BRANCH="$branch_name"
+    LAUNCHED_WORKER_WORKTREE="$worktree_dir"
+    LAUNCHED_WORKER_RESULT_FILE="$result_file"
+    LAUNCHED_WORKER_CONSOLE_LOG="$worker_console_log"
+    return 0
+}
+
+integrate_story_commit() {
+    local story_key="$1"
+    local commit_sha="$2"
+    local _worktree_dir="$3"
+    local branch_name="$4"
+    local epic_num=""
+    local epic_key=""
+    local subject=""
+    local modified_files=""
+
+    epic_num="$(get_epic_for_story "$story_key")"
+    epic_key="epic-$epic_num"
+    subject="feat(epic-$epic_num): implement $story_key"
+
+    log STEP "Integrating $story_key from $branch_name..."
+    cd "$PROJECT_ROOT"
+
+    if [[ -n "$commit_sha" ]]; then
+        if git cherry-pick --no-commit "$commit_sha" >/dev/null 2>&1; then
+            :
+        else
+            log ERROR "Cherry-pick failed for $story_key from $branch_name"
+            git cherry-pick --abort >/dev/null 2>&1 || git reset --merge >/dev/null 2>&1 || true
+            return 1
+        fi
+    else
+        log INFO "Worker for $story_key produced no repository commit; recording the authoritative status update only."
+    fi
+
+    if [[ "$(get_story_status "$epic_key")" == "backlog" ]]; then
+        update_story_status "$epic_key" "in-progress"
+    fi
+    update_story_status "$story_key" "done"
+    git add "$SPRINT_STATUS"
+
+    if ! unstage_ralph_logs; then
+        git cherry-pick --abort >/dev/null 2>&1 || git reset --merge >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if ! unstage_codex_runtime_files; then
+        git cherry-pick --abort >/dev/null 2>&1 || git reset --merge >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if git diff --cached --quiet; then
+        log WARN "No staged changes remained while integrating $story_key"
+        git cherry-pick --abort >/dev/null 2>&1 || git reset --merge >/dev/null 2>&1 || true
+        return 1
+    fi
+
+    if [[ -n "$commit_sha" ]]; then
+        if git commit -C "$commit_sha" >/dev/null 2>&1; then
+            log OK "Integrated story $story_key into $(git branch --show-current 2>/dev/null || echo current branch)"
+            return 0
+        fi
+    else
+        modified_files="$(summarize_staged_files)"
+        if git commit -m "$(cat <<EOF
+$subject
+
+Files: $modified_files
+EOF
+)"; then
+            log OK "Integrated story $story_key into $(git branch --show-current 2>/dev/null || echo current branch)"
+            return 0
         fi
     fi
+
+    log ERROR "Commit failed while integrating $story_key from $branch_name"
+    git cherry-pick --abort >/dev/null 2>&1 || git reset --merge >/dev/null 2>&1 || true
+    return 1
+}
+
+wait_for_worker_completion() {
+    local -n active_pids_ref="$1"
+    local -n active_stories_ref="$2"
+    local -n active_results_ref="$3"
+    local -n active_worktrees_ref="$4"
+    local -n active_branches_ref="$5"
+    local -n active_console_logs_ref="$6"
+    local -n processed_ref="$7"
+    local -n failed_ref="$8"
+
+    local index=0
+    local pid=0
+    local wait_status=0
+    local result_file=""
+    local story_key=""
+    local branch_name=""
+    local worktree_dir=""
+    local result_status=""
+    local result_commit_sha=""
+    local result_log_file=""
+    local keep_checkout="false"
+
+    while true; do
+        for index in "${!active_pids_ref[@]}"; do
+            pid="${active_pids_ref[$index]}"
+            if kill -0 "$pid" 2>/dev/null; then
+                continue
+            fi
+
+            if wait "$pid"; then
+                wait_status=0
+            else
+                wait_status=$?
+            fi
+
+            result_file="${active_results_ref[$index]}"
+            story_key="${active_stories_ref[$index]}"
+            branch_name="${active_branches_ref[$index]}"
+            worktree_dir="${active_worktrees_ref[$index]}"
+            result_status="failed"
+            result_commit_sha=""
+            result_log_file="${active_console_logs_ref[$index]}"
+
+            if [[ -f "$result_file" ]]; then
+                unset RALPH_WORKER_RESULT_STATUS RALPH_WORKER_RESULT_STORY RALPH_WORKER_RESULT_BRANCH
+                unset RALPH_WORKER_RESULT_WORKTREE RALPH_WORKER_RESULT_EXIT_CODE RALPH_WORKER_RESULT_COMMIT_SHA
+                unset RALPH_WORKER_RESULT_LOG_FILE
+                # shellcheck disable=SC1090
+                source "$result_file"
+                result_status="${RALPH_WORKER_RESULT_STATUS:-failed}"
+                result_commit_sha="${RALPH_WORKER_RESULT_COMMIT_SHA:-}"
+                result_log_file="${RALPH_WORKER_RESULT_LOG_FILE:-$result_log_file}"
+            fi
+
+            if [[ "$wait_status" -eq 0 && "$result_status" == "success" ]]; then
+                if integrate_story_commit "$story_key" "$result_commit_sha" "$worktree_dir" "$branch_name"; then
+                    processed_ref=$((processed_ref + 1))
+                    check_epic_completion "$(get_epic_for_story "$story_key")" || {
+                        failed_ref=$((failed_ref + 1))
+                        log ERROR "Failed to finalize epic after integrating $story_key"
+                    }
+                    keep_checkout="$KEEP_WORKTREES_ON_SUCCESS"
+                else
+                    failed_ref=$((failed_ref + 1))
+                    keep_checkout="$KEEP_WORKTREES_ON_FAILURE"
+                fi
+            else
+                failed_ref=$((failed_ref + 1))
+                log ERROR "Worker failed for $story_key (exit code: $wait_status)"
+                log ERROR "Inspect worker logs: ${result_log_file:-$result_file}"
+                keep_checkout="$KEEP_WORKTREES_ON_FAILURE"
+            fi
+
+            cleanup_worker_checkout "$branch_name" "$worktree_dir" "$keep_checkout"
+            unset 'active_pids_ref[$index]' 'active_stories_ref[$index]' 'active_results_ref[$index]' \
+                'active_worktrees_ref[$index]' 'active_branches_ref[$index]' 'active_console_logs_ref[$index]'
+            return 0
+        done
+
+        sleep 1
+    done
+}
+
+run_parallel_stories() {
+    local pending_stories=("$@")
+    local active_pids=()
+    local active_stories=()
+    local active_results=()
+    local active_worktrees=()
+    local active_branches=()
+    local active_console_logs=()
+    local processed=0
+    local failed=0
+    local launched_this_round=false
+    local story_key=""
+    local index=0
+    local ready_found=false
+
+    ensure_parallel_safe_worktree
+    prepare_parallel_runtime
+
+    while true; do
+        launched_this_round=false
+
+        while [[ "$(count_entries "${active_pids[@]}")" -lt "$CONCURRENCY" ]]; do
+            ready_found=false
+
+            for index in "${!pending_stories[@]}"; do
+                story_key="${pending_stories[$index]}"
+                if story_dependencies_satisfied "$story_key"; then
+                    ready_found=true
+                    break
+                fi
+            done
+
+            if [[ "$ready_found" != "true" ]]; then
+                break
+            fi
+
+            if launch_story_worker "$story_key"; then
+                active_pids+=("$LAUNCHED_WORKER_PID")
+                active_stories+=("$story_key")
+                active_results+=("$LAUNCHED_WORKER_RESULT_FILE")
+                active_worktrees+=("$LAUNCHED_WORKER_WORKTREE")
+                active_branches+=("$LAUNCHED_WORKER_BRANCH")
+                active_console_logs+=("$LAUNCHED_WORKER_CONSOLE_LOG")
+                unset 'pending_stories[$index]'
+                launched_this_round=true
+            else
+                failed=$((failed + 1))
+                log ERROR "Failed to launch worker for $story_key"
+                unset 'pending_stories[$index]'
+            fi
+        done
+
+        if [[ "$(count_entries "${active_pids[@]}")" -eq 0 && "$(count_entries "${pending_stories[@]}")" -eq 0 ]]; then
+            break
+        fi
+
+        if [[ "$(count_entries "${active_pids[@]}")" -eq 0 && "$(count_entries "${pending_stories[@]}")" -gt 0 ]]; then
+            log ERROR "No runnable stories remain; unresolved dependencies are blocking progress:"
+            for story_key in "${pending_stories[@]}"; do
+                [[ -n "$story_key" ]] && echo "  - $story_key"
+            done
+            failed=$((failed + $(count_entries "${pending_stories[@]}")))
+            break
+        fi
+
+        if [[ "$launched_this_round" == "true" || "$(count_entries "${active_pids[@]}")" -gt 0 ]]; then
+            wait_for_worker_completion active_pids active_stories active_results active_worktrees active_branches active_console_logs processed failed
+        fi
+    done
+
+    echo ""
+    echo -e "${CYAN}============================================================${NC}"
+    echo -e "${GREEN}                  Implementation Summary${NC}"
+    echo -e "${CYAN}============================================================${NC}"
+    echo ""
+    echo -e "  ${GREEN}[+] Processed:${NC} $processed stories"
+    if [[ $failed -gt 0 ]]; then
+        echo -e "  ${RED}[x] Failed:${NC}    $failed stories"
+    fi
+    echo -e "  ${BLUE}[i] Log:${NC}       $LOG_FILE"
+    echo ""
+
+    if [[ $failed -gt 0 ]]; then
+        return 1
+    fi
+
+    return 0
 }
 
 # =============================================================================
@@ -590,6 +1634,23 @@ main() {
         esac
     done
 
+    if [[ -n "$WORKER_STORY" && -z "$SPECIFIC_STORY" ]]; then
+        SPECIFIC_STORY="$WORKER_STORY"
+    fi
+
+    validate_numeric_setting "RALPH_CONCURRENCY" "$CONCURRENCY"
+    validate_numeric_setting "RALPH_MAX_REVIEW_PASSES" "$MAX_REVIEW_PASSES"
+
+    if [[ "$DRY_RUN" == "true" && "$CONCURRENCY" -gt 1 ]]; then
+        log WARN "Parallel execution is disabled during dry-run previews; falling back to sequential planning mode."
+        CONCURRENCY=1
+    fi
+
+    if [[ "$CONCURRENCY" -gt 1 ]] && ! bash_supports_parallel_mode; then
+        log ERROR "Parallel mode requires Bash 4.3+ (current: $BASH_VERSION)"
+        exit 1
+    fi
+
     # Setup
     normalize_provider
     validate_provider
@@ -603,6 +1664,11 @@ main() {
     if [[ "$DRY_RUN" == "true" ]]; then
         echo -e "${YELLOW}  [DRY-RUN MODE] No changes will be made${NC}"
         echo ""
+    fi
+
+    if [[ "$WORKER_MODE" == "true" ]]; then
+        worker_main
+        return $?
     fi
 
     # Pre-flight checks
@@ -654,6 +1720,12 @@ main() {
         fi
     fi
 
+    if parallel_mode_enabled; then
+        log INFO "Parallel mode enabled (RALPH_CONCURRENCY=$CONCURRENCY)"
+        run_parallel_stories "${stories[@]}"
+        return $?
+    fi
+
     # Process each story
     local processed=0
     local failed=0
@@ -664,7 +1736,14 @@ main() {
 
         # Track epic changes for retrospective
         if [[ "$current_epic" != "$epic_num" && -n "$current_epic" ]]; then
-            check_epic_completion "$current_epic"
+            if ! check_epic_completion "$current_epic"; then
+                failed=$((failed + 1))
+                log ERROR "Failed to finalize epic: $current_epic"
+
+                if ! should_continue_after_failure "Continue after epic finalization failure?"; then
+                    break
+                fi
+            fi
         fi
         current_epic="$epic_num"
 
@@ -674,9 +1753,7 @@ main() {
             failed=$((failed + 1))
             log ERROR "Failed to process story: $story"
 
-            echo ""
-            read -p "Continue with next story? [Y/n]: " cont
-            if [[ "$cont" =~ ^[Nn] ]]; then
+            if ! should_continue_after_failure "Continue with next story after failure?"; then
                 break
             fi
         fi
@@ -684,7 +1761,10 @@ main() {
 
     # Final epic check
     if [[ -n "$current_epic" ]]; then
-        check_epic_completion "$current_epic"
+        if ! check_epic_completion "$current_epic"; then
+            failed=$((failed + 1))
+            log ERROR "Failed to finalize epic: $current_epic"
+        fi
     fi
 
     # Summary
@@ -704,3 +1784,7 @@ main() {
         exit 1
     fi
 }
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
