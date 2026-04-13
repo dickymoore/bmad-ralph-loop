@@ -14,7 +14,7 @@ This document explains the workflow system used by BMAD Ralph Loop.
 
 ## Overview
 
-BMAD Ralph Loop orchestrates three main workflows in sequence:
+BMAD Ralph Loop orchestrates three main workflows in an iterative sequence:
 
 ```
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
@@ -39,7 +39,8 @@ stateDiagram-v2
     [*] --> backlog: Initial state
     backlog --> ready_for_dev: create-story (SM)
     ready_for_dev --> review: dev-story (DEV)
-    review --> done: code-review (DEV)
+    review --> ready_for_dev: code-review requests follow-up dev
+    review --> done: code-review clean
     done --> [*]: Complete
 
     backlog --> blocked: Manual
@@ -52,9 +53,23 @@ stateDiagram-v2
 |------------|----------|---------|-------|
 | `backlog` | `ready-for-dev` | `create-story` workflow | SM |
 | `ready-for-dev` | `review` | `dev-story` workflow | DEV |
-| `review` | `done` | `code-review` workflow | DEV |
+| `review` | `ready-for-dev` | `code-review` requests another dev pass | DEV |
+| `review` | `done` | `code-review` completes cleanly | DEV |
 | Any | `blocked` | Manual intervention | Human |
 | `blocked` | `backlog` | Manual intervention | Human |
+
+### Parallel Controller Mode
+
+When `RALPH_CONCURRENCY` is greater than `1`, Ralph switches to a controller/worker model:
+
+1. The controller stays in the main repo and owns the authoritative `sprint-status.yaml`.
+2. Each runnable story gets its own git branch and git worktree.
+3. Each worker runs the story lifecycle for one story only.
+4. The controller integrates successful worker commits back serially, then updates the authoritative story status.
+5. Epic retrospective, epic completion commit, and epic push still run only on the controller branch.
+
+Stories listed in `dependencies:` do not launch until every dependency is `done`.
+If integration fails, Ralph keeps the worker worktree for inspection and leaves the authoritative story status unchanged.
 
 ### Epic States
 
@@ -140,16 +155,17 @@ Epics transition automatically:
 
 **Output**:
 - Code fixes if needed
-- Review completion
+- Review result (`clean` or another dev pass)
 
 **What it does**:
 1. Reviews implementation against story requirements
 2. Checks code quality
 3. Verifies tests pass
-4. Fixes any issues found
+4. Fixes any issues found or requests another dev pass
 5. Validates acceptance criteria
+6. Signals whether Ralph should loop back into `dev-story`
 
-**Status change**: `review` → `done`
+**Status change**: `review` → `ready-for-dev` when follow-up work is needed, otherwise `review` → `done`
 
 ---
 
@@ -308,15 +324,16 @@ CRITICAL: Run in fully autonomous mode. Do NOT ask questions.
 If a workflow fails:
 1. Status is NOT updated
 2. Error is logged
-3. User is prompted to continue or abort
-4. Story can be retried by running again
+3. Ralph continues automatically by default (`RALPH_PROMPT_ON_FAILURE=false`)
+4. Optional prompting can be re-enabled with `RALPH_PROMPT_ON_FAILURE=true`
+5. Story can be retried by running again
 
 ### Verification Guards
 
 After each workflow, Ralph Loop verifies:
 - **create-story**: Story file exists
 - **dev-story**: Git shows modified files
-- **code-review**: Workflow completes without error
+- **code-review**: Workflow completes without error and either emits a clean result or triggers another dev pass
 
 ### Recovery
 
@@ -335,5 +352,6 @@ To recover from a failed workflow:
 1. **Run dry-run first**: Always preview with `--dry-run`
 2. **Process incrementally**: Use `--epic` or `--story` for control
 3. **Check logs**: Review logs after each run
-4. **Commit frequently**: Each story creates a commit
+4. **Commit frequently**: Each story creates a commit, and each completed epic creates a final sync commit
 5. **Use verbose mode**: Add `--verbose` when debugging
+6. **Expect logs to stay local**: Ralph excludes its own `ralph-*.log` files from Ralph-generated commits

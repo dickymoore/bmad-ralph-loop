@@ -7,7 +7,7 @@
 
 > **Automate your BMAD development workflow with Claude Code CLI or OpenAI Codex CLI**
 
-BMAD Ralph Loop is a CLI automation tool that orchestrates development cycles using Claude Code CLI or OpenAI Codex CLI and the BMAD Method agents. It manages the complete story lifecycle: from story creation by the Scrum Master agent, through implementation by the Developer agent, to code review — all running autonomously.
+BMAD Ralph Loop is a CLI automation tool that orchestrates development cycles using Claude Code CLI or OpenAI Codex CLI and the BMAD Method agents. It manages the complete story lifecycle: from story creation by the Scrum Master agent, through implementation by the Developer agent, to code review and follow-up rework until the story is clean — all running autonomously.
 
 ![Demo](docs/assets/demo.gif)
 *Demo placeholder - Record your own workflow!*
@@ -16,15 +16,17 @@ BMAD Ralph Loop is a CLI automation tool that orchestrates development cycles us
 
 ## Features
 
-- **Autonomous Development Loop** — Runs the full cycle: create-story → dev-story → code-review
+- **Autonomous Development Loop** — Runs the full cycle: create-story → dev-story → code-review, looping review feedback back into dev-story until clean
 - **BMAD Method Integration** — Built for the BMAD (BMad Agile Development) methodology
 - **Multi-Agent Orchestration** — Coordinates SM (Scrum Master) and DEV (Developer) agents
 - **Sprint Status Tracking** — YAML-based status management with automatic updates
-- **Intelligent Story Processing** — Handles backlog, ready-for-dev, review, and done states
-- **Epic Management** — Automatic epic completion detection and retrospectives
+- **Intelligent Story Processing** — Handles backlog, ready-for-dev, review, and done states, including review-to-dev retries
+- **Epic Management** — Automatic epic completion detection, retrospectives, and end-of-epic branch sync
+- **Parallel Story Workers** — Optional worktree-based parallel execution with dependency-aware scheduling
 - **Dry-Run Mode** — Preview all actions before execution
 - **Selective Processing** — Target specific epics or individual stories
-- **Auto-Commit** — Commits changes with proper conventional commit messages
+- **Auto-Commit** — Commits each story and finalizes each completed epic with a dedicated commit
+- **Log-Safe Commits** — Excludes Ralph runtime logs from Ralph-generated commits
 - **Verbose Logging** — Detailed logs for debugging and audit trails
 
 ---
@@ -55,7 +57,7 @@ codex-ralph-loop
 - **Claude Code CLI** — [Install from claude.ai](https://claude.ai)
 - **OpenAI Codex CLI** — [Install from OpenAI docs](https://developers.openai.com/codex/cli)
 - **yq** — YAML processor
-- **Bash 4+** — Modern bash shell
+- **Bash 4+** — Modern bash shell (`Bash 4.3+` required for parallel mode)
 
 Install at least one provider CLI (Claude or Codex).
 
@@ -143,6 +145,9 @@ claude-ralph-loop --verbose
 
 # Use Codex instead of Claude
 codex-ralph-loop
+
+# Run multiple ready stories in parallel
+RALPH_CONCURRENCY=3 codex-ralph-loop
 ```
 
 ### Choose Your CLI
@@ -170,7 +175,18 @@ your-project/
 |----------|---------|-------------|
 | `RALPH_PROJECT_ROOT` | Auto-detected | Project root directory |
 | `RALPH_SPRINT_STATUS` | `_bmad-output/implementation-artifacts/sprint-status.yaml` | Path to sprint status |
-| `RALPH_LOG_DIR` | `scripts/logs` | Directory for log files |
+| `RALPH_LOG_DIR` | `logs/` | Directory for log files |
+| `RALPH_AUTO_RETROSPECTIVE` | `true` | Run retrospectives automatically when an epic completes |
+| `RALPH_MAX_REVIEW_PASSES` | `5` | Maximum review/dev loops before Ralph aborts a story |
+| `RALPH_PROMPT_ON_FAILURE` | `false` | Ask before continuing after failures |
+| `RALPH_AUTO_PUSH_EPIC` | `true` | Push the current branch when an epic completes |
+| `RALPH_EPIC_PUSH_REMOTE` | Current upstream | Override the remote used for automatic epic pushes |
+| `RALPH_CONCURRENCY` | `1` | Number of stories to process in parallel |
+| `RALPH_RUNTIME_ROOT` | `../.ralph-runtime/<repo>` | Shared runtime root for parallel worker state |
+| `RALPH_WORKTREE_ROOT` | `$RALPH_RUNTIME_ROOT/worktrees` | Parallel worker git worktrees |
+| `RALPH_RESULT_ROOT` | `$RALPH_RUNTIME_ROOT/results` | Parallel worker result and console logs |
+| `RALPH_KEEP_WORKTREES_ON_SUCCESS` | `false` | Keep successful worker worktrees for inspection |
+| `RALPH_KEEP_WORKTREES_ON_FAILURE` | `true` | Keep failed worker worktrees for debugging |
 
 ### Sprint Status Format
 
@@ -191,6 +207,17 @@ development_status:
 ```
 
 See [examples/sprint-status.example.yaml](examples/sprint-status.example.yaml) for a complete example.
+
+### Parallel Mode
+
+Set `RALPH_CONCURRENCY` above `1` to enable worktree-based parallel execution. Ralph keeps the main repo as the controller, launches one worker branch/worktree per runnable story, merges completed worker commits back serially, and only finalizes epics on the controller branch.
+
+Parallel mode has a few safety rules:
+- The authoritative project worktree must be clean except for Ralph log files.
+- `RALPH_WORKTREE_ROOT` and `RALPH_RESULT_ROOT` must stay outside the project repository.
+- Absolute `story_location` values must point inside the project repo; Ralph remaps them into each worker worktree automatically.
+- Story dependencies in `sprint-status.yaml` must be `done` before a dependent story will launch.
+- Failed worker integrations keep the worker worktree for inspection and leave the authoritative story status unchanged.
 
 ---
 
@@ -230,12 +257,17 @@ See [examples/sprint-status.example.yaml](examples/sprint-status.example.yaml) f
 
 3. **Code Review (DEV Agent)**
    - Reviews implementation against story requirements
-   - Auto-fixes issues found
-   - Updates status: `review` → `done`
+   - Can make fixes or request another dev pass
+   - Updates status: `review` → `ready-for-dev` when follow-up work is needed, otherwise `review` → `done`
 
 4. **Auto-Commit**
    - Commits all changes with conventional commit format
    - Message: `feat(epic-N): implement X-Y`
+
+5. **Epic Finalization**
+   - Marks the epic complete when all stories are done
+   - Runs the retrospective automatically by default
+   - Creates a final epic completion commit and pushes the branch
 
 ---
 
@@ -256,7 +288,7 @@ BMAD Method Workflow:
     └── Build Cycle (repeated for each story):
         ├── create-story (SM Agent)
         ├── dev-story (DEV Agent)
-        └── code-review (DEV Agent)
+        └── code-review (DEV Agent, loops back to dev-story until clean)
 ```
 
 ### The Build Cycle
@@ -267,9 +299,9 @@ In the BMAD Method, each story goes through this cycle:
 |------|-------|----------|---------|
 | 1 | SM | `create-story` | Create story file from epic |
 | 2 | DEV | `dev-story` | Implement the story |
-| 3 | DEV | `code-review` | Quality validation |
+| 3 | DEV | `code-review` | Quality validation and dev-loop feedback |
 
-**BMAD Ralph Loop automates this entire cycle**, running each workflow autonomously in sequence for every pending story.
+**BMAD Ralph Loop automates this entire cycle**, running each workflow autonomously for every pending story until review is clean.
 
 ### Prerequisites
 
