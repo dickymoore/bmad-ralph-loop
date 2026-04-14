@@ -110,6 +110,8 @@ retrospectives:
 | `RALPH_RESULT_ROOT` | `$RALPH_RUNTIME_ROOT/results` | Worker result files, logs, and console captures |
 | `RALPH_KEEP_WORKTREES_ON_SUCCESS` | `false` | Keep successful worker worktrees instead of deleting them |
 | `RALPH_KEEP_WORKTREES_ON_FAILURE` | `true` | Keep failed worker worktrees for debugging |
+| `RALPH_WORKFLOW_IDLE_TIMEOUT` | `7200` | Fail a provider workflow after this many idle seconds without new output |
+| `RALPH_WORKER_IDLE_TIMEOUT` | `10800` | Fail a parallel worker after this many idle seconds without new output |
 | `RALPH_CODEX_FULL_AUTO` | `true` | Use `--full-auto` with Codex exec |
 | `RALPH_CODEX_SANDBOX` | *(empty)* | Codex sandbox mode (e.g., `danger-full-access`) |
 | `RALPH_CODEX_MODEL` | *(empty)* | Codex model override |
@@ -245,6 +247,8 @@ Parallel mode rules:
 - Stories listed in `dependencies:` will not launch until every dependency is `done`.
 - Parallel mode requires `Bash 4.3+`.
 - If a worker commit fails to integrate, Ralph leaves the authoritative story status unchanged and keeps the worker worktree for manual inspection.
+- If a provider workflow or parallel worker stops producing output long enough to exceed its idle timeout, Ralph terminates it and records the story as failed instead of waiting forever.
+- When a story is retried, Ralph copies reference material from the latest kept worktree for that story into `.ralph/previous-attempt/` inside the new worker worktree.
 
 Example:
 
