@@ -111,6 +111,7 @@ retrospectives:
 | `RALPH_KEEP_WORKTREES_ON_FAILURE` | `true` | Keep failed worker worktrees for debugging |
 | `RALPH_WORKFLOW_IDLE_TIMEOUT` | `7200` | Fail a provider workflow after this many idle seconds without new output |
 | `RALPH_WORKER_IDLE_TIMEOUT` | `10800` | Fail a parallel worker after this many idle seconds without new output |
+| `RALPH_CONTROL_FILE` | `$RALPH_RUNTIME_ROOT/control` | Runtime control file for `pause`, `resume`, `drain`, or `stop` |
 | `RALPH_CODEX_FULL_AUTO` | `true` | Use `--full-auto` with Codex exec |
 | `RALPH_CODEX_SANDBOX` | *(empty)* | Codex sandbox mode (e.g., `danger-full-access`) |
 | `RALPH_CODEX_MODEL` | *(empty)* | Codex model override |
@@ -248,6 +249,26 @@ Parallel mode rules:
 - If a worker commit fails to integrate, Ralph leaves the authoritative story status unchanged and keeps the worker worktree for manual inspection.
 - If a provider workflow or parallel worker stops producing output long enough to exceed its idle timeout, Ralph terminates it and records the story as failed instead of waiting forever.
 - When a story is retried, Ralph copies reference material from the latest kept worktree for that story into `.ralph/previous-attempt/` inside the new worker worktree.
+- The wrapper scripts source an immutable per-run snapshot of `ralph-loop-core.sh`, so editing the repo copy during an active run does not change the live controller or workers.
+- Ralph prints both the controller PID and the runtime control-file path at startup.
+
+### Runtime Control File
+
+Ralph polls `RALPH_CONTROL_FILE` during an active run. Write one of these commands into the file:
+
+```bash
+echo pause > /path/to/control
+echo resume > /path/to/control
+echo drain > /path/to/control
+echo stop > /path/to/control
+```
+
+- `pause`: stop launching new stories but let active workers keep running
+- `resume`: allow new eligible stories to launch again
+- `drain`: graceful stop; Ralph waits for active workers to finish, then exits with remaining stories deferred
+- `stop`: immediate stop; Ralph terminates active workers, keeps their worktrees for salvage, and exits with those stories deferred
+
+Ralph ignores control-file contents that predate the current run. Rewrite the file during the run for a command to take effect.
 
 Example:
 

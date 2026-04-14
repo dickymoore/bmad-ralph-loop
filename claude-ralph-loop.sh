@@ -17,6 +17,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
 CORE_PATH="$SCRIPT_DIR/ralph-loop-core.sh"
+SNAPSHOT_ROOT="${RALPH_SCRIPT_SNAPSHOT_ROOT:-${TMPDIR:-/tmp}/ralph-script-snapshots}"
+SNAPSHOT_CORE=""
 
 export PROVIDER="claude"
 
@@ -25,7 +27,12 @@ if [[ ! -f "$CORE_PATH" ]]; then
     exit 1
 fi
 
+mkdir -p "$SNAPSHOT_ROOT"
+SNAPSHOT_CORE="$SNAPSHOT_ROOT/ralph-loop-core-$(date +%Y%m%d-%H%M%S)-$$.sh"
+cp "$CORE_PATH" "$SNAPSHOT_CORE"
+chmod +x "$SNAPSHOT_CORE"
+
 # shellcheck source=ralph-loop-core.sh
-source "$CORE_PATH"
+source "$SNAPSHOT_CORE"
 
 main "$@"
