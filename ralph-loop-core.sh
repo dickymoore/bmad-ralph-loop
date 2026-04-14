@@ -84,6 +84,12 @@ SPECIFIC_STORY=""
 SKIP_CODE_REVIEW=false
 SKIP_RETRO="${RALPH_SKIP_RETRO:-false}"
 VERBOSE=false
+SHUTDOWN_REQUESTED=false
+SHUTDOWN_SIGNAL=""
+STOP_NOW_REQUESTED=false
+CONTROL_PAUSED=false
+CONTROL_FILE_LAST_MTIME=0
+CONTROL_FILE_LAST_COMMAND=""
 
 # Provider selection (claude|codex)
 PROVIDER="${PROVIDER:-claude}"
@@ -110,6 +116,7 @@ WORKTREE_ROOT="${RALPH_WORKTREE_ROOT:-$RUNTIME_ROOT/worktrees}"
 RESULT_ROOT="${RALPH_RESULT_ROOT:-$RUNTIME_ROOT/results}"
 WORKFLOW_IDLE_TIMEOUT="${RALPH_WORKFLOW_IDLE_TIMEOUT:-7200}"
 WORKER_IDLE_TIMEOUT="${RALPH_WORKER_IDLE_TIMEOUT:-10800}"
+CONTROL_FILE="${RALPH_CONTROL_FILE:-$RUNTIME_ROOT/control}"
 
 # =============================================================================
 # Helper Functions
@@ -202,6 +209,7 @@ usage() {
     echo "  RALPH_KEEP_WORKTREES_ON_FAILURE Keep failed worker worktrees (default: true)"
     echo "  RALPH_WORKFLOW_IDLE_TIMEOUT Fail a provider workflow after this many idle seconds (default: 7200)"
     echo "  RALPH_WORKER_IDLE_TIMEOUT Fail a parallel worker after this many idle seconds (default: 10800)"
+    echo "  RALPH_CONTROL_FILE    Runtime control file for pause/resume/drain/stop commands"
     if [[ "$PROVIDER" == "codex" ]]; then
         echo "  RALPH_CODEX_FULL_AUTO Use --full-auto with codex exec (default: true)"
         echo "  RALPH_CODEX_SANDBOX   Codex sandbox mode (e.g., danger-full-access)"
@@ -412,6 +420,91 @@ count_entries() {
     echo "$count"
 }
 
+controller_shutdown_requested() {
+    [[ "$WORKER_MODE" != "true" && "$SHUTDOWN_REQUESTED" == "true" ]]
+}
+
+controller_stop_requested() {
+    [[ "$WORKER_MODE" != "true" && "$STOP_NOW_REQUESTED" == "true" ]]
+}
+
+controller_paused() {
+    [[ "$WORKER_MODE" != "true" && "$CONTROL_PAUSED" == "true" ]]
+}
+
+request_controller_shutdown() {
+    local signal="$1"
+
+    if [[ "$WORKER_MODE" == "true" ]]; then
+        return 0
+    fi
+
+    if [[ "$SHUTDOWN_REQUESTED" == "true" ]]; then
+        return 0
+    fi
+
+    SHUTDOWN_REQUESTED=true
+    SHUTDOWN_SIGNAL="$signal"
+    log WARN "Received $signal. Ralph will stop launching new stories and wait for active workers to finish."
+}
+
+request_controller_stop() {
+    local source="$1"
+
+    if [[ "$WORKER_MODE" == "true" ]]; then
+        return 0
+    fi
+
+    if [[ "$STOP_NOW_REQUESTED" == "true" ]]; then
+        return 0
+    fi
+
+    STOP_NOW_REQUESTED=true
+    SHUTDOWN_REQUESTED=true
+    SHUTDOWN_SIGNAL="$source"
+    log WARN "Received $source. Ralph will stop launching new stories and terminate active work."
+}
+
+request_controller_pause() {
+    local source="$1"
+
+    if [[ "$WORKER_MODE" == "true" ]]; then
+        return 0
+    fi
+
+    if controller_shutdown_requested || controller_stop_requested; then
+        log WARN "Ignoring pause request from $source because shutdown is already in progress."
+        return 0
+    fi
+
+    if [[ "$CONTROL_PAUSED" == "true" ]]; then
+        return 0
+    fi
+
+    CONTROL_PAUSED=true
+    log WARN "Pause requested via $source. Ralph will stop launching new stories until resumed."
+}
+
+request_controller_resume() {
+    local source="$1"
+
+    if [[ "$WORKER_MODE" == "true" ]]; then
+        return 0
+    fi
+
+    if controller_shutdown_requested || controller_stop_requested; then
+        log WARN "Ignoring resume request from $source because shutdown is already in progress."
+        return 0
+    fi
+
+    if [[ "$CONTROL_PAUSED" != "true" ]]; then
+        return 0
+    fi
+
+    CONTROL_PAUSED=false
+    log INFO "Resume requested via $source. Ralph will continue launching eligible stories."
+}
+
 file_mtime_epoch() {
     local path="$1"
 
@@ -444,6 +537,76 @@ latest_file_mtime_epoch() {
     done
 
     echo "$latest"
+}
+
+read_controller_command() {
+    [[ -f "$CONTROL_FILE" ]] || return 1
+
+    awk '
+        {
+            gsub(/\r/, "")
+        }
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        {
+            print tolower($1)
+            exit
+        }
+    ' "$CONTROL_FILE"
+}
+
+poll_controller_control_file() {
+    local current_mtime=0
+    local command=""
+
+    if [[ "$WORKER_MODE" == "true" ]]; then
+        return 0
+    fi
+
+    current_mtime="$(file_mtime_epoch "$CONTROL_FILE" 2>/dev/null || echo 0)"
+    [[ "$current_mtime" =~ ^[0-9]+$ ]] || current_mtime=0
+
+    command="$(read_controller_command 2>/dev/null || true)"
+
+    if [[ "$current_mtime" -le "$CONTROL_FILE_LAST_MTIME" && "$command" == "$CONTROL_FILE_LAST_COMMAND" ]]; then
+        return 0
+    fi
+
+    CONTROL_FILE_LAST_MTIME="$current_mtime"
+    CONTROL_FILE_LAST_COMMAND="$command"
+
+    case "$command" in
+        pause)
+            request_controller_pause "control file ($CONTROL_FILE)"
+            ;;
+        resume|run|continue)
+            request_controller_resume "control file ($CONTROL_FILE)"
+            ;;
+        drain|shutdown)
+            request_controller_shutdown "control file ($CONTROL_FILE)"
+            ;;
+        stop|abort)
+            request_controller_stop "control file ($CONTROL_FILE)"
+            ;;
+        "")
+            log INFO "Control file changed but contained no command. Supported commands: pause, resume, drain, stop."
+            ;;
+        *)
+            log WARN "Ignoring unknown control command '$command' in $CONTROL_FILE. Supported commands: pause, resume, drain, stop."
+            ;;
+    esac
+}
+
+wait_while_controller_paused() {
+    while controller_paused; do
+        poll_controller_control_file
+
+        if controller_shutdown_requested || controller_stop_requested; then
+            break
+        fi
+
+        sleep 1
+    done
 }
 
 list_child_pids() {
@@ -492,6 +655,7 @@ run_command_with_watchdog() {
     local now=0
     local exit_code=0
     local timed_out=false
+    local interrupted_by_controller=false
     local poll_interval=1
 
     if [[ -n "$capture_file" ]]; then
@@ -526,6 +690,16 @@ run_command_with_watchdog() {
     fi
 
     while kill -0 "$runner_pid" 2>/dev/null; do
+        if [[ "$WORKER_MODE" != "true" ]]; then
+            poll_controller_control_file
+            if controller_stop_requested; then
+                log WARN "Immediate stop requested. Terminating workflow $workflow_name."
+                force_stop_process_tree "$runner_pid"
+                interrupted_by_controller=true
+                break
+            fi
+        fi
+
         if [[ "$WORKFLOW_IDLE_TIMEOUT" -gt 0 ]]; then
             current_activity="$(latest_file_mtime_epoch "${watch_files[@]}")"
             if [[ "$current_activity" -gt "$last_activity" ]]; then
@@ -552,6 +726,10 @@ run_command_with_watchdog() {
 
     if [[ "$timed_out" == "true" ]]; then
         return 124
+    fi
+
+    if [[ "$interrupted_by_controller" == "true" ]]; then
+        return 130
     fi
 
     return "$exit_code"
@@ -1179,7 +1357,11 @@ unstage_codex_runtime_files() {
 }
 
 unstage_retry_context_files() {
-    unstage_paths_matching_regex "parallel retry context" '(^|/)\.ralph/previous-attempt(/|$)'
+    if git diff --cached --quiet -- .ralph/previous-attempt 2>/dev/null; then
+        return 0
+    fi
+
+    unstage_paths "parallel retry context" ".ralph/previous-attempt"
 }
 
 unstage_worker_commit_noise() {
@@ -1401,8 +1583,16 @@ process_story() {
     local current_status=$(get_story_status "$story_key")
     local review_pass=0
     local retry_context_prompt=""
+    local create_story_context=""
+    local dev_story_context=""
 
     retry_context_prompt="$(get_retry_context_prompt)"
+    create_story_context="The story to create is $story_key from Epic $epic_num."
+    dev_story_context="The story to implement is $story_key."
+    if [[ -n "$retry_context_prompt" ]]; then
+        create_story_context+=$'\n\n'"$retry_context_prompt"
+        dev_story_context+=$'\n\n'"$retry_context_prompt"
+    fi
 
     echo ""
     echo -e "${CYAN}============================================================${NC}"
@@ -1420,9 +1610,7 @@ process_story() {
     # Step 1: Create Story (SM agent)
     if [[ "$current_status" == "backlog" ]]; then
         log STEP "[1/3] Creating story file..."
-        run_agent_workflow "SM" "create-story" "Create story file for $story_key" "The story to create is $story_key from Epic $epic_num.${retry_context_prompt:+
-
-$retry_context_prompt}"
+        run_agent_workflow "SM" "create-story" "Create story file for $story_key" "$create_story_context"
 
         if [[ "$DRY_RUN" == "true" ]]; then
             log INFO "[1/3] Dry run: skipping story file verification and status update"
@@ -1448,9 +1636,7 @@ $retry_context_prompt}"
                 log INFO "Re-entering dev-story after code review feedback (next pass: $((review_pass + 1)))"
             fi
             log STEP "[2/3] Implementing story..."
-            run_agent_workflow "DEV" "dev-story" "Implement story $story_key" "The story to implement is $story_key.${retry_context_prompt:+
-
-$retry_context_prompt}"
+            run_agent_workflow "DEV" "dev-story" "Implement story $story_key" "$dev_story_context"
 
             verify_implementation "$story_key"
 
@@ -1754,6 +1940,7 @@ wait_for_worker_completion() {
     local -n active_console_logs_ref="$6"
     local -n processed_ref="$7"
     local -n failed_ref="$8"
+    local -n deferred_ref="$9"
 
     local index=0
     local pid=0
@@ -1763,12 +1950,22 @@ wait_for_worker_completion() {
     local branch_name=""
     local worktree_dir=""
     local result_status=""
+    local result_exit_code=""
     local result_commit_sha=""
     local result_log_file=""
     local keep_checkout="false"
     local stale_worker="false"
+    local stop_requested="false"
 
     while true; do
+        poll_controller_control_file
+
+        if controller_stop_requested; then
+            for pid in "${active_pids_ref[@]}"; do
+                [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && force_stop_process_tree "$pid"
+            done
+        fi
+
         for index in "${!active_pids_ref[@]}"; do
             pid="${active_pids_ref[$index]}"
             result_file="${active_results_ref[$index]}"
@@ -1776,9 +1973,13 @@ wait_for_worker_completion() {
             branch_name="${active_branches_ref[$index]}"
             worktree_dir="${active_worktrees_ref[$index]}"
             stale_worker="false"
+            stop_requested="false"
 
             if kill -0 "$pid" 2>/dev/null; then
-                if worker_is_stale "$result_file" "${active_console_logs_ref[$index]}"; then
+                if controller_stop_requested; then
+                    stop_requested="true"
+                    force_stop_process_tree "$pid"
+                elif worker_is_stale "$result_file" "${active_console_logs_ref[$index]}"; then
                     stale_worker="true"
                     log ERROR "Worker for $story_key exceeded the idle timeout (${WORKER_IDLE_TIMEOUT}s) with no new output. Terminating the worker so Ralph can continue."
                     force_stop_process_tree "$pid"
@@ -1807,11 +2008,23 @@ wait_for_worker_completion() {
                 # shellcheck disable=SC1090
                 source "$result_file"
                 result_status="${RALPH_WORKER_RESULT_STATUS:-failed}"
+                result_exit_code="${RALPH_WORKER_RESULT_EXIT_CODE:-}"
                 result_commit_sha="${RALPH_WORKER_RESULT_COMMIT_SHA:-}"
                 result_log_file="${RALPH_WORKER_RESULT_LOG_FILE:-$result_log_file}"
             fi
 
-            if [[ "$wait_status" -eq 0 && "$result_status" == "success" ]]; then
+            if controller_stop_requested || [[ "$stop_requested" == "true" ]]; then
+                deferred_ref=$((deferred_ref + 1))
+                log WARN "Worker stopped for $story_key due to controller stop request. Authoritative status was left unchanged."
+                keep_checkout="$KEEP_WORKTREES_ON_FAILURE"
+            elif [[ "$result_status" == "success" && "$result_exit_code" == "0" && "$wait_status" -ne 0 ]]; then
+                log WARN "Worker for $story_key exited with status $wait_status after recording a successful result. Trusting result.env and continuing integration."
+                wait_status=0
+            fi
+
+            if controller_stop_requested || [[ "$stop_requested" == "true" ]]; then
+                :
+            elif [[ "$wait_status" -eq 0 && "$result_status" == "success" ]]; then
                 if integrate_story_commit "$story_key" "$result_commit_sha" "$worktree_dir" "$branch_name"; then
                     processed_ref=$((processed_ref + 1))
                     check_epic_completion "$(get_epic_for_story "$story_key")" || {
@@ -1853,6 +2066,7 @@ run_parallel_stories() {
     local active_console_logs=()
     local processed=0
     local failed=0
+    local deferred=0
     local launched_this_round=false
     local story_key=""
     local index=0
@@ -1862,9 +2076,10 @@ run_parallel_stories() {
     prepare_parallel_runtime
 
     while true; do
+        poll_controller_control_file
         launched_this_round=false
 
-        while [[ "$(count_entries "${active_pids[@]}")" -lt "$CONCURRENCY" ]]; do
+        while [[ "$SHUTDOWN_REQUESTED" != "true" && "$CONTROL_PAUSED" != "true" && "$(count_entries "${active_pids[@]}")" -lt "$CONCURRENCY" ]]; do
             ready_found=false
 
             for index in "${!pending_stories[@]}"; do
@@ -1895,8 +2110,23 @@ run_parallel_stories() {
             fi
         done
 
+        if controller_stop_requested && [[ "$(count_entries "${active_pids[@]}")" -eq 0 ]]; then
+            deferred=$((deferred + $(count_entries "${pending_stories[@]}")))
+            break
+        fi
+
         if [[ "$(count_entries "${active_pids[@]}")" -eq 0 && "$(count_entries "${pending_stories[@]}")" -eq 0 ]]; then
             break
+        fi
+
+        if controller_shutdown_requested && [[ "$(count_entries "${active_pids[@]}")" -eq 0 ]]; then
+            deferred=$((deferred + $(count_entries "${pending_stories[@]}")))
+            break
+        fi
+
+        if controller_paused && [[ "$(count_entries "${active_pids[@]}")" -eq 0 ]] && [[ "$(count_entries "${pending_stories[@]}")" -gt 0 ]]; then
+            wait_while_controller_paused
+            continue
         fi
 
         if [[ "$(count_entries "${active_pids[@]}")" -eq 0 && "$(count_entries "${pending_stories[@]}")" -gt 0 ]]; then
@@ -1909,7 +2139,7 @@ run_parallel_stories() {
         fi
 
         if [[ "$launched_this_round" == "true" || "$(count_entries "${active_pids[@]}")" -gt 0 ]]; then
-            wait_for_worker_completion active_pids active_stories active_results active_worktrees active_branches active_console_logs processed failed
+            wait_for_worker_completion active_pids active_stories active_results active_worktrees active_branches active_console_logs processed failed deferred
         fi
     done
 
@@ -1922,11 +2152,24 @@ run_parallel_stories() {
     if [[ $failed -gt 0 ]]; then
         echo -e "  ${RED}[x] Failed:${NC}    $failed stories"
     fi
+    if [[ $deferred -gt 0 ]]; then
+        echo -e "  ${YELLOW}[!] Deferred:${NC}  $deferred stories"
+    fi
     echo -e "  ${BLUE}[i] Log:${NC}       $LOG_FILE"
     echo ""
 
     if [[ $failed -gt 0 ]]; then
         return 1
+    fi
+
+    if controller_stop_requested; then
+        log WARN "Stop completed. Active work was terminated and ${deferred} story/stories remain pending."
+        return 130
+    fi
+
+    if controller_shutdown_requested; then
+        log WARN "Graceful shutdown completed after draining active workers. ${deferred} story/stories remain pending."
+        return 130
     fi
 
     return 0
@@ -2004,6 +2247,15 @@ main() {
     log INFO "Project root: $PROJECT_ROOT"
     log INFO "Provider: $PROVIDER"
     log INFO "Log file: $LOG_FILE"
+    if [[ "$WORKER_MODE" != "true" ]]; then
+        mkdir -p "$(dirname "$CONTROL_FILE")"
+        CONTROL_FILE_LAST_MTIME="$(file_mtime_epoch "$CONTROL_FILE" 2>/dev/null || echo 0)"
+        CONTROL_FILE_LAST_COMMAND="$(read_controller_command 2>/dev/null || true)"
+        log INFO "Controller PID: $$"
+        log INFO "Control file: $CONTROL_FILE"
+        trap 'request_controller_shutdown TERM' TERM
+        trap 'request_controller_shutdown INT' INT
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
         echo -e "${YELLOW}  [DRY-RUN MODE] No changes will be made${NC}"
@@ -2076,6 +2328,22 @@ main() {
     local current_epic=""
 
     for story in "${stories[@]}"; do
+        poll_controller_control_file
+
+        if controller_paused; then
+            wait_while_controller_paused
+        fi
+
+        if controller_stop_requested; then
+            log WARN "Immediate stop requested. Stopping before launching story $story."
+            break
+        fi
+
+        if controller_shutdown_requested; then
+            log WARN "Graceful shutdown requested. Stopping before launching story $story."
+            break
+        fi
+
         local epic_num=$(get_epic_for_story "$story")
 
         # Track epic changes for retrospective
@@ -2094,6 +2362,10 @@ main() {
         if process_story "$story"; then
             processed=$((processed + 1))
         else
+            if controller_stop_requested; then
+                log WARN "Immediate stop requested while processing story: $story"
+                break
+            fi
             failed=$((failed + 1))
             log ERROR "Failed to process story: $story"
 
@@ -2104,7 +2376,7 @@ main() {
     done
 
     # Final epic check
-    if [[ -n "$current_epic" ]]; then
+    if [[ -n "$current_epic" && "$STOP_NOW_REQUESTED" != "true" ]]; then
         if ! check_epic_completion "$current_epic"; then
             failed=$((failed + 1))
             log ERROR "Failed to finalize epic: $current_epic"
@@ -2121,11 +2393,27 @@ main() {
     if [[ $failed -gt 0 ]]; then
         echo -e "  ${RED}[x] Failed:${NC}    $failed stories"
     fi
+    if controller_shutdown_requested || controller_stop_requested; then
+        local pending_after_shutdown=$(( ${#stories[@]} - processed - failed ))
+        if [[ "$pending_after_shutdown" -gt 0 ]]; then
+            echo -e "  ${YELLOW}[!] Deferred:${NC}  $pending_after_shutdown stories"
+        fi
+    fi
     echo -e "  ${BLUE}[i] Log:${NC}       $LOG_FILE"
     echo ""
 
     if [[ $failed -gt 0 ]]; then
         exit 1
+    fi
+
+    if controller_stop_requested; then
+        log WARN "Immediate stop completed."
+        exit 130
+    fi
+
+    if controller_shutdown_requested; then
+        log WARN "Graceful shutdown completed after the current story finished."
+        exit 130
     fi
 }
 

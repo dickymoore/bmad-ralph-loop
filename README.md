@@ -191,6 +191,7 @@ your-project/
 | `RALPH_KEEP_WORKTREES_ON_FAILURE` | `true` | Keep failed worker worktrees for debugging |
 | `RALPH_WORKFLOW_IDLE_TIMEOUT` | `7200` | Fail a provider workflow after this many idle seconds with no new output |
 | `RALPH_WORKER_IDLE_TIMEOUT` | `10800` | Fail a parallel worker after this many idle seconds with no new output |
+| `RALPH_CONTROL_FILE` | `$RALPH_RUNTIME_ROOT/control` | Runtime control file for `pause`, `resume`, `drain`, or `stop` |
 
 ### Sprint Status Format
 
@@ -224,6 +225,26 @@ Parallel mode has a few safety rules:
 - Failed worker integrations keep the worker worktree for inspection and leave the authoritative story status unchanged.
 - Stale provider workflows and parallel workers are failed automatically once their idle timeout expires, so a wedged CLI does not block the entire run forever.
 - When a story is retried, Ralph attaches the latest kept worktree for that story under `.ralph/previous-attempt/` inside the new worker so the agent can salvage useful prior work.
+- The wrapper scripts run from a per-run snapshot of `ralph-loop-core.sh`, so editing the repo copy while Ralph is active will not corrupt the live run.
+- Ralph prints both the controller PID and control-file path at startup. You can send `TERM` to the controller PID for a graceful drain, or write commands to the control file while the run is active.
+
+### Runtime Control File
+
+Ralph polls `RALPH_CONTROL_FILE` while it is running. Update the file with one of these commands:
+
+```bash
+echo pause > /path/to/control
+echo resume > /path/to/control
+echo drain > /path/to/control
+echo stop > /path/to/control
+```
+
+- `pause`: stop launching new stories, but let already-running work continue
+- `resume`: start launching eligible stories again
+- `drain`: stop launching new stories and exit after active work finishes
+- `stop`: terminate active work and exit without integrating unfinished stories
+
+Ralph ignores stale control-file contents from before the current run. You must rewrite the file during the active run for a command to take effect.
 
 ---
 
