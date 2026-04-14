@@ -187,6 +187,8 @@ your-project/
 | `RALPH_RESULT_ROOT` | `$RALPH_RUNTIME_ROOT/results` | Parallel worker result and console logs |
 | `RALPH_KEEP_WORKTREES_ON_SUCCESS` | `false` | Keep successful worker worktrees for inspection |
 | `RALPH_KEEP_WORKTREES_ON_FAILURE` | `true` | Keep failed worker worktrees for debugging |
+| `RALPH_WORKFLOW_IDLE_TIMEOUT` | `7200` | Fail a provider workflow after this many idle seconds with no new output |
+| `RALPH_WORKER_IDLE_TIMEOUT` | `10800` | Fail a parallel worker after this many idle seconds with no new output |
 
 ### Sprint Status Format
 
@@ -218,6 +220,8 @@ Parallel mode has a few safety rules:
 - Absolute `story_location` values must point inside the project repo; Ralph remaps them into each worker worktree automatically.
 - Story dependencies in `sprint-status.yaml` must be `done` before a dependent story will launch.
 - Failed worker integrations keep the worker worktree for inspection and leave the authoritative story status unchanged.
+- Stale provider workflows and parallel workers are failed automatically once their idle timeout expires, so a wedged CLI does not block the entire run forever.
+- When a story is retried, Ralph attaches the latest kept worktree for that story under `.ralph/previous-attempt/` inside the new worker so the agent can salvage useful prior work.
 
 ---
 

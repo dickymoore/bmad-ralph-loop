@@ -107,6 +107,8 @@ PROJECT_PARENT="$(cd "$PROJECT_ROOT/.." 2>/dev/null && pwd || echo "$PROJECT_ROO
 RUNTIME_ROOT="${RALPH_RUNTIME_ROOT:-$PROJECT_PARENT/.ralph-runtime/$(basename "$PROJECT_ROOT")}"
 WORKTREE_ROOT="${RALPH_WORKTREE_ROOT:-$RUNTIME_ROOT/worktrees}"
 RESULT_ROOT="${RALPH_RESULT_ROOT:-$RUNTIME_ROOT/results}"
+WORKFLOW_IDLE_TIMEOUT="${RALPH_WORKFLOW_IDLE_TIMEOUT:-7200}"
+WORKER_IDLE_TIMEOUT="${RALPH_WORKER_IDLE_TIMEOUT:-10800}"
 
 # =============================================================================
 # Helper Functions
@@ -195,6 +197,8 @@ usage() {
     echo "  RALPH_RESULT_ROOT     Directory for parallel worker result files"
     echo "  RALPH_KEEP_WORKTREES_ON_SUCCESS Keep successful worker worktrees (default: false)"
     echo "  RALPH_KEEP_WORKTREES_ON_FAILURE Keep failed worker worktrees (default: true)"
+    echo "  RALPH_WORKFLOW_IDLE_TIMEOUT Fail a provider workflow after this many idle seconds (default: 7200)"
+    echo "  RALPH_WORKER_IDLE_TIMEOUT Fail a parallel worker after this many idle seconds (default: 10800)"
     if [[ "$PROVIDER" == "codex" ]]; then
         echo "  RALPH_CODEX_FULL_AUTO Use --full-auto with codex exec (default: true)"
         echo "  RALPH_CODEX_SANDBOX   Codex sandbox mode (e.g., danger-full-access)"
@@ -405,6 +409,151 @@ count_entries() {
     echo "$count"
 }
 
+file_mtime_epoch() {
+    local path="$1"
+
+    [[ -e "$path" ]] || return 1
+
+    if stat -c %Y "$path" >/dev/null 2>&1; then
+        stat -c %Y "$path"
+        return 0
+    fi
+
+    if stat -f %m "$path" >/dev/null 2>&1; then
+        stat -f %m "$path"
+        return 0
+    fi
+
+    return 1
+}
+
+latest_file_mtime_epoch() {
+    local latest=0
+    local path=""
+    local current=0
+
+    for path in "$@"; do
+        current="$(file_mtime_epoch "$path" 2>/dev/null || echo 0)"
+        [[ "$current" =~ ^[0-9]+$ ]] || current=0
+        if [[ "$current" -gt "$latest" ]]; then
+            latest="$current"
+        fi
+    done
+
+    echo "$latest"
+}
+
+list_child_pids() {
+    ps -o pid= --ppid "$1" 2>/dev/null | awk '{$1=$1; print}'
+}
+
+terminate_process_tree() {
+    local pid="$1"
+    local signal="${2:-TERM}"
+    local child=""
+
+    while IFS= read -r child; do
+        [[ -n "$child" ]] && terminate_process_tree "$child" "$signal"
+    done < <(list_child_pids "$pid")
+
+    kill "-$signal" "$pid" 2>/dev/null || true
+}
+
+force_stop_process_tree() {
+    local pid="$1"
+    local deadline=$(( $(date +%s) + 5 ))
+
+    terminate_process_tree "$pid" TERM
+
+    while kill -0 "$pid" 2>/dev/null; do
+        if [[ "$(date +%s)" -ge "$deadline" ]]; then
+            break
+        fi
+        sleep 1
+    done
+
+    if kill -0 "$pid" 2>/dev/null; then
+        terminate_process_tree "$pid" KILL
+    fi
+}
+
+run_command_with_watchdog() {
+    local workflow_name="$1"
+    local capture_file="${2:-}"
+    shift 2
+    local command=("$@")
+    local watch_files=("$LOG_FILE")
+    local runner_pid=0
+    local last_activity=0
+    local current_activity=0
+    local now=0
+    local exit_code=0
+    local timed_out=false
+    local poll_interval=1
+
+    if [[ -n "$capture_file" ]]; then
+        : > "$capture_file"
+        watch_files+=("$capture_file")
+    fi
+
+    (
+        if [[ "$VERBOSE" == "true" || -n "$capture_file" ]]; then
+            local tee_args=("-a" "$LOG_FILE")
+            if [[ -n "$capture_file" ]]; then
+                tee_args+=("$capture_file")
+            fi
+
+            if [[ "$VERBOSE" == "true" ]]; then
+                "${command[@]}" 2>&1 | tee "${tee_args[@]}"
+            else
+                "${command[@]}" 2>&1 | tee "${tee_args[@]}" >/dev/null
+            fi
+            exit "${PIPESTATUS[0]}"
+        fi
+
+        "${command[@]}" >> "$LOG_FILE" 2>&1
+    ) &
+    runner_pid=$!
+
+    if [[ "$WORKFLOW_IDLE_TIMEOUT" -gt 0 ]]; then
+        last_activity="$(latest_file_mtime_epoch "${watch_files[@]}")"
+        if [[ "$last_activity" -le 0 ]]; then
+            last_activity="$(date +%s)"
+        fi
+    fi
+
+    while kill -0 "$runner_pid" 2>/dev/null; do
+        if [[ "$WORKFLOW_IDLE_TIMEOUT" -gt 0 ]]; then
+            current_activity="$(latest_file_mtime_epoch "${watch_files[@]}")"
+            if [[ "$current_activity" -gt "$last_activity" ]]; then
+                last_activity="$current_activity"
+            fi
+
+            now="$(date +%s)"
+            if [[ "$last_activity" -gt 0 && $((now - last_activity)) -ge "$WORKFLOW_IDLE_TIMEOUT" ]]; then
+                log ERROR "Workflow $workflow_name exceeded the idle timeout (${WORKFLOW_IDLE_TIMEOUT}s) with no new output. Terminating the provider process."
+                force_stop_process_tree "$runner_pid"
+                timed_out=true
+                break
+            fi
+        fi
+
+        sleep "$poll_interval"
+    done
+
+    if wait "$runner_pid"; then
+        exit_code=0
+    else
+        exit_code=$?
+    fi
+
+    if [[ "$timed_out" == "true" ]]; then
+        return 124
+    fi
+
+    return "$exit_code"
+}
+
 parallel_mode_enabled() {
     if [[ "$WORKER_MODE" == "true" ]]; then
         return 1
@@ -419,6 +568,46 @@ parallel_mode_enabled() {
     fi
 
     return 0
+}
+
+worker_last_activity_epoch() {
+    local result_file="$1"
+    local console_log="$2"
+    local result_dir=""
+    local worker_log_dir=""
+    local worker_log=""
+    local watch_files=()
+
+    result_dir="$(dirname "$result_file")"
+    worker_log_dir="$result_dir/logs"
+    watch_files+=("$console_log" "$result_file" "$result_dir/sprint-status.yaml")
+
+    if [[ -d "$worker_log_dir" ]]; then
+        while IFS= read -r worker_log; do
+            [[ -n "$worker_log" ]] && watch_files+=("$worker_log")
+        done < <(find "$worker_log_dir" -maxdepth 1 -type f -name 'ralph-*.log' 2>/dev/null)
+    fi
+
+    latest_file_mtime_epoch "${watch_files[@]}"
+}
+
+worker_is_stale() {
+    local result_file="$1"
+    local console_log="$2"
+    local last_activity=0
+    local now=0
+
+    if [[ "$WORKER_IDLE_TIMEOUT" -le 0 ]]; then
+        return 1
+    fi
+
+    last_activity="$(worker_last_activity_epoch "$result_file" "$console_log")"
+    if [[ "$last_activity" -le 0 ]]; then
+        return 1
+    fi
+
+    now="$(date +%s)"
+    [[ $((now - last_activity)) -ge "$WORKER_IDLE_TIMEOUT" ]]
 }
 
 ensure_parallel_safe_worktree() {
@@ -470,6 +659,156 @@ prepare_worker_sprint_status() {
 
     log ERROR "Parallel mode requires story_location to be relative or under the project root (got: $configured_story_location)"
     return 1
+}
+
+find_latest_story_result_dir() {
+    local story_key="$1"
+    local current_result_dir="${2:-}"
+    local result_dir=""
+    local latest_result_dir=""
+
+    while IFS= read -r result_dir; do
+        [[ -z "$result_dir" ]] && continue
+        [[ -n "$current_result_dir" && "$result_dir" == "$current_result_dir" ]] && continue
+        latest_result_dir="$result_dir"
+    done < <(find "$RESULT_ROOT" -maxdepth 1 -mindepth 1 -type d -name "${story_key}-*" 2>/dev/null | sort)
+
+    [[ -n "$latest_result_dir" ]] && echo "$latest_result_dir"
+}
+
+copy_retry_context_untracked_files() {
+    local previous_worktree="$1"
+    local destination_root="$2"
+    local path=""
+
+    mkdir -p "$destination_root"
+
+    while IFS= read -r -d '' path; do
+        case "$path" in
+            .codex|.codex/*|.ralph/previous-attempt|.ralph/previous-attempt/*|logs/ralph-*.log)
+                continue
+                ;;
+        esac
+
+        [[ -e "$previous_worktree/$path" ]] || continue
+        mkdir -p "$destination_root/$(dirname "$path")"
+        cp -a "$previous_worktree/$path" "$destination_root/$path"
+    done < <(git -C "$previous_worktree" ls-files --others --exclude-standard -z 2>/dev/null)
+}
+
+prepare_retry_context() {
+    local story_key="$1"
+    local current_result_dir="$2"
+    local worktree_dir="$3"
+    local previous_result_dir=""
+    local previous_result_file=""
+    local previous_result_status="unknown"
+    local previous_commit_sha=""
+    local previous_log_file=""
+    local previous_worktree=""
+    local context_dir=""
+    local previous_story_rel=""
+    local previous_story_path=""
+    local copied_untracked_root=""
+
+    previous_result_dir="$(find_latest_story_result_dir "$story_key" "$current_result_dir")"
+    [[ -n "$previous_result_dir" ]] || return 0
+
+    previous_result_file="$previous_result_dir/result.env"
+    if [[ -f "$previous_result_file" ]]; then
+        unset RALPH_WORKER_RESULT_STATUS RALPH_WORKER_RESULT_COMMIT_SHA
+        unset RALPH_WORKER_RESULT_LOG_FILE RALPH_WORKER_RESULT_WORKTREE
+        # shellcheck disable=SC1090
+        source "$previous_result_file"
+        previous_result_status="${RALPH_WORKER_RESULT_STATUS:-unknown}"
+        previous_commit_sha="${RALPH_WORKER_RESULT_COMMIT_SHA:-}"
+        previous_log_file="${RALPH_WORKER_RESULT_LOG_FILE:-}"
+        previous_worktree="${RALPH_WORKER_RESULT_WORKTREE:-}"
+    fi
+
+    if [[ -z "$previous_worktree" ]]; then
+        previous_worktree="$WORKTREE_ROOT/$(basename "$previous_result_dir")"
+    fi
+
+    if [[ ! -d "$previous_worktree" ]]; then
+        log WARN "Found previous attempt metadata for $story_key but the kept worktree is missing: $previous_worktree"
+        return 0
+    fi
+
+    context_dir="$worktree_dir/.ralph/previous-attempt"
+    rm -rf "$context_dir"
+    mkdir -p "$context_dir"
+
+    previous_story_rel="$(get_repo_relative_path "$(get_story_file_path "$story_key")")"
+    if [[ -n "$previous_story_rel" ]]; then
+        previous_story_path="$previous_worktree/$previous_story_rel"
+        if [[ -f "$previous_story_path" ]]; then
+            cp -a "$previous_story_path" "$context_dir/story.md"
+        fi
+    fi
+
+    if [[ -n "$previous_log_file" && -f "$previous_log_file" ]]; then
+        tail -n 200 "$previous_log_file" > "$context_dir/previous-log-tail.txt"
+    fi
+
+    if git -C "$previous_worktree" rev-parse --git-dir >/dev/null 2>&1; then
+        git -C "$previous_worktree" status --short --untracked-files=all > "$context_dir/previous-status.txt" 2>/dev/null || true
+        git -C "$previous_worktree" diff --binary > "$context_dir/previous-worktree.diff" 2>/dev/null || true
+        git -C "$previous_worktree" diff --binary --cached > "$context_dir/previous-index.diff" 2>/dev/null || true
+
+        if [[ -n "$previous_commit_sha" && "$previous_commit_sha" != "''" ]] && git -C "$previous_worktree" cat-file -e "${previous_commit_sha}^{commit}" 2>/dev/null; then
+            git -C "$previous_worktree" show --stat --summary "$previous_commit_sha" > "$context_dir/previous-commit-summary.txt" 2>/dev/null || true
+            git -C "$previous_worktree" show "$previous_commit_sha" > "$context_dir/previous-commit.patch" 2>/dev/null || true
+        fi
+
+        copied_untracked_root="$context_dir/untracked"
+        copy_retry_context_untracked_files "$previous_worktree" "$copied_untracked_root"
+        if [[ -d "$copied_untracked_root" ]] && [[ -z "$(find "$copied_untracked_root" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+            rmdir "$copied_untracked_root" 2>/dev/null || true
+        fi
+    fi
+
+    for path in \
+        "$context_dir/previous-status.txt" \
+        "$context_dir/previous-worktree.diff" \
+        "$context_dir/previous-index.diff" \
+        "$context_dir/previous-commit-summary.txt" \
+        "$context_dir/previous-commit.patch" \
+        "$context_dir/previous-log-tail.txt"; do
+        [[ -s "$path" ]] || rm -f "$path"
+    done
+
+    cat > "$context_dir/README.md" <<EOF
+# Previous Ralph Attempt
+
+Ralph found a previous kept worktree for story \`$story_key\`.
+
+- Previous result directory: \`$previous_result_dir\`
+- Previous worktree: \`$previous_worktree\`
+- Previous result status: \`$previous_result_status\`
+- Previous commit SHA: \`${previous_commit_sha:-none}\`
+- Previous log file: \`${previous_log_file:-none}\`
+
+Use the files in this directory as reference material before starting work again. Salvage useful context, patches, and files instead of starting from scratch when that is faster.
+
+Important:
+- The authoritative repo state is still the current main worktree, not the old kept worktree.
+- Do not commit anything from \`.ralph/previous-attempt\` itself.
+- If \`previous-commit.patch\` exists, it is the best summary of a prior successful worker that later failed integration.
+- If \`previous-worktree.diff\` or \`untracked/\` exist, they capture unfinished changes from a failed worker attempt.
+EOF
+
+    log INFO "Attached previous attempt context for $story_key from $previous_result_dir"
+}
+
+get_retry_context_prompt() {
+    local context_dir="$PROJECT_ROOT/.ralph/previous-attempt"
+
+    if [[ -f "$context_dir/README.md" ]]; then
+        cat <<'EOF'
+A previous Ralph attempt for this story is available under .ralph/previous-attempt/. Review that reference material before starting, salvage useful changes or patches from it when appropriate, and do not commit anything from .ralph/previous-attempt itself.
+EOF
+    fi
 }
 
 get_story_dependencies() {
@@ -586,28 +925,12 @@ REVIEW LOOP CONTRACT:
     # Run provider with the workflow
     case "$PROVIDER" in
         claude)
-            if [[ -n "$capture_file" ]]; then
-                : > "$capture_file"
-            fi
+            local claude_cmd=("claude" "--print" "--dangerously-skip-permissions" "$prompt")
 
-            if [[ "$VERBOSE" == "true" || -n "$capture_file" ]]; then
-                local tee_args=("-a" "$LOG_FILE")
-                if [[ -n "$capture_file" ]]; then
-                    tee_args+=("$capture_file")
-                fi
-
-                if [[ "$VERBOSE" == "true" ]]; then
-                    claude --print --dangerously-skip-permissions "$prompt" 2>&1 | tee "${tee_args[@]}"
-                else
-                    claude --print --dangerously-skip-permissions "$prompt" 2>&1 | tee "${tee_args[@]}" >/dev/null
-                fi
-                exit_code=${PIPESTATUS[0]}
+            if run_command_with_watchdog "$workflow" "$capture_file" "${claude_cmd[@]}"; then
+                exit_code=0
             else
-                if claude --print --dangerously-skip-permissions "$prompt" >> "$LOG_FILE" 2>&1; then
-                    exit_code=0
-                else
-                    exit_code=$?
-                fi
+                exit_code=$?
             fi
             ;;
         codex)
@@ -629,28 +952,12 @@ REVIEW LOOP CONTRACT:
                 codex_args+=("--model" "$CODEX_MODEL")
             fi
 
-            if [[ -n "$capture_file" ]]; then
-                : > "$capture_file"
-            fi
+            local codex_cmd=("codex" "${codex_args[@]}" "$prompt")
 
-            if [[ "$VERBOSE" == "true" || -n "$capture_file" ]]; then
-                local tee_args=("-a" "$LOG_FILE")
-                if [[ -n "$capture_file" ]]; then
-                    tee_args+=("$capture_file")
-                fi
-
-                if [[ "$VERBOSE" == "true" ]]; then
-                    codex "${codex_args[@]}" "$prompt" 2>&1 | tee "${tee_args[@]}"
-                else
-                    codex "${codex_args[@]}" "$prompt" 2>&1 | tee "${tee_args[@]}" >/dev/null
-                fi
-                exit_code=${PIPESTATUS[0]}
+            if run_command_with_watchdog "$workflow" "$capture_file" "${codex_cmd[@]}"; then
+                exit_code=0
             else
-                if codex "${codex_args[@]}" "$prompt" >> "$LOG_FILE" 2>&1; then
-                    exit_code=0
-                else
-                    exit_code=$?
-                fi
+                exit_code=$?
             fi
             ;;
     esac
@@ -868,6 +1175,10 @@ unstage_codex_runtime_files() {
     unstage_paths_matching_regex "Codex runtime files" '(^|/)\.codex$'
 }
 
+unstage_retry_context_files() {
+    unstage_paths_matching_regex "parallel retry context" '(^|/)\.ralph/previous-attempt(/|$)'
+}
+
 unstage_worker_commit_noise() {
     local story_dir_rel=""
     local current_story_rel=""
@@ -925,6 +1236,10 @@ commit_changes() {
     fi
 
     if ! unstage_codex_runtime_files; then
+        return 1
+    fi
+
+    if ! unstage_retry_context_files; then
         return 1
     fi
 
@@ -1082,6 +1397,9 @@ process_story() {
     local epic_num=$(get_epic_for_story "$story_key")
     local current_status=$(get_story_status "$story_key")
     local review_pass=0
+    local retry_context_prompt=""
+
+    retry_context_prompt="$(get_retry_context_prompt)"
 
     echo ""
     echo -e "${CYAN}============================================================${NC}"
@@ -1099,7 +1417,9 @@ process_story() {
     # Step 1: Create Story (SM agent)
     if [[ "$current_status" == "backlog" ]]; then
         log STEP "[1/3] Creating story file..."
-        run_agent_workflow "SM" "create-story" "Create story file for $story_key" "The story to create is $story_key from Epic $epic_num."
+        run_agent_workflow "SM" "create-story" "Create story file for $story_key" "The story to create is $story_key from Epic $epic_num.${retry_context_prompt:+
+
+$retry_context_prompt}"
 
         if [[ "$DRY_RUN" == "true" ]]; then
             log INFO "[1/3] Dry run: skipping story file verification and status update"
@@ -1125,7 +1445,9 @@ process_story() {
                 log INFO "Re-entering dev-story after code review feedback (next pass: $((review_pass + 1)))"
             fi
             log STEP "[2/3] Implementing story..."
-            run_agent_workflow "DEV" "dev-story" "Implement story $story_key" "The story to implement is $story_key."
+            run_agent_workflow "DEV" "dev-story" "Implement story $story_key" "The story to implement is $story_key.${retry_context_prompt:+
+
+$retry_context_prompt}"
 
             verify_implementation "$story_key"
 
@@ -1304,6 +1626,11 @@ launch_story_worker() {
         return 1
     fi
 
+    if ! prepare_retry_context "$story_key" "$result_dir" "$worktree_dir"; then
+        cleanup_worker_checkout "$branch_name" "$worktree_dir" "false"
+        return 1
+    fi
+
     worker_args=("--story" "$story_key")
     if [[ "$SKIP_CODE_REVIEW" == "true" ]]; then
         worker_args+=("--skip-review")
@@ -1434,12 +1761,25 @@ wait_for_worker_completion() {
     local result_commit_sha=""
     local result_log_file=""
     local keep_checkout="false"
+    local stale_worker="false"
 
     while true; do
         for index in "${!active_pids_ref[@]}"; do
             pid="${active_pids_ref[$index]}"
+            result_file="${active_results_ref[$index]}"
+            story_key="${active_stories_ref[$index]}"
+            branch_name="${active_branches_ref[$index]}"
+            worktree_dir="${active_worktrees_ref[$index]}"
+            stale_worker="false"
+
             if kill -0 "$pid" 2>/dev/null; then
-                continue
+                if worker_is_stale "$result_file" "${active_console_logs_ref[$index]}"; then
+                    stale_worker="true"
+                    log ERROR "Worker for $story_key exceeded the idle timeout (${WORKER_IDLE_TIMEOUT}s) with no new output. Terminating the worker so Ralph can continue."
+                    force_stop_process_tree "$pid"
+                else
+                    continue
+                fi
             fi
 
             if wait "$pid"; then
@@ -1447,11 +1787,10 @@ wait_for_worker_completion() {
             else
                 wait_status=$?
             fi
+            if [[ "$stale_worker" == "true" ]]; then
+                wait_status=124
+            fi
 
-            result_file="${active_results_ref[$index]}"
-            story_key="${active_stories_ref[$index]}"
-            branch_name="${active_branches_ref[$index]}"
-            worktree_dir="${active_worktrees_ref[$index]}"
             result_status="failed"
             result_commit_sha=""
             result_log_file="${active_console_logs_ref[$index]}"
@@ -1481,6 +1820,9 @@ wait_for_worker_completion() {
                 fi
             else
                 failed_ref=$((failed_ref + 1))
+                if [[ "$stale_worker" == "true" ]]; then
+                    log ERROR "Worker timed out waiting for new output: ${result_log_file:-$result_file}"
+                fi
                 log ERROR "Worker failed for $story_key (exit code: $wait_status)"
                 log ERROR "Inspect worker logs: ${result_log_file:-$result_file}"
                 keep_checkout="$KEEP_WORKTREES_ON_FAILURE"
@@ -1631,6 +1973,8 @@ main() {
 
     validate_numeric_setting "RALPH_CONCURRENCY" "$CONCURRENCY"
     validate_numeric_setting "RALPH_MAX_REVIEW_PASSES" "$MAX_REVIEW_PASSES"
+    validate_numeric_setting "RALPH_WORKFLOW_IDLE_TIMEOUT" "$WORKFLOW_IDLE_TIMEOUT"
+    validate_numeric_setting "RALPH_WORKER_IDLE_TIMEOUT" "$WORKER_IDLE_TIMEOUT"
 
     if [[ "$DRY_RUN" == "true" && "$CONCURRENCY" -gt 1 ]]; then
         log WARN "Parallel execution is disabled during dry-run previews; falling back to sequential planning mode."
