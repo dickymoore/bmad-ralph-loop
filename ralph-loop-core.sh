@@ -79,6 +79,8 @@ NC='\033[0m' # No Color
 
 # Flags
 DRY_RUN=false
+ASSUME_YES=false
+NOTIFY_BELL=false
 SPECIFIC_EPIC=""
 SPECIFIC_STORY=""
 SKIP_CODE_REVIEW=false
@@ -103,6 +105,7 @@ AUTO_RETROSPECTIVE="${RALPH_AUTO_RETROSPECTIVE:-true}"
 MAX_REVIEW_PASSES="${RALPH_MAX_REVIEW_PASSES:-5}"
 PROMPT_ON_FAILURE="${RALPH_PROMPT_ON_FAILURE:-false}"
 AUTO_PUSH_EPIC="${RALPH_AUTO_PUSH_EPIC:-true}"
+NOTIFY_BELL="${RALPH_NOTIFY_BELL:-$NOTIFY_BELL}"
 EPIC_PUSH_REMOTE="${RALPH_EPIC_PUSH_REMOTE:-}"
 CONCURRENCY="${RALPH_CONCURRENCY:-1}"
 WORKER_MODE="${RALPH_WORKER_MODE:-false}"
@@ -144,6 +147,18 @@ log() {
     esac
 }
 
+notify_controller_completion() {
+    if [[ "$WORKER_MODE" == "true" || "$NOTIFY_BELL" != "true" ]]; then
+        return 0
+    fi
+
+    if [[ -w /dev/tty ]]; then
+        printf '\a' > /dev/tty
+    else
+        printf '\a'
+    fi
+}
+
 banner() {
     echo ""
     echo -e "${MAGENTA}"
@@ -178,6 +193,8 @@ usage() {
     echo ""
     echo "Options:"
     echo "  --dry-run           Preview actions without executing"
+    echo "  --yes, -y           Skip the implementation confirmation prompt"
+    echo "  --bell              Ring the terminal bell when the controller exits"
     echo "  --epic N            Process only stories from epic N"
     echo "  --story X-Y         Process specific story (e.g., 1-1)"
     echo "  --skip-review       Skip code-review step"
@@ -187,6 +204,8 @@ usage() {
     echo ""
     echo "Examples:"
     echo "  $cli_name                # Process all pending stories"
+    echo "  $cli_name --yes          # Run without asking for confirmation"
+    echo "  $cli_name --bell         # Ring the terminal bell on completion"
     echo "  $cli_name --dry-run      # Preview what would happen"
     echo "  $cli_name --epic 1       # Process only Epic 1 stories"
     echo "  $cli_name --story 1-2    # Process only story 1-2"
@@ -200,6 +219,7 @@ usage() {
     echo "  RALPH_MAX_REVIEW_PASSES Maximum review/dev loops before aborting (default: 5)"
     echo "  RALPH_PROMPT_ON_FAILURE Prompt before continuing after failures (default: false)"
     echo "  RALPH_AUTO_PUSH_EPIC  Push the current branch when an epic completes (default: true)"
+    echo "  RALPH_NOTIFY_BELL    Ring the terminal bell when the controller exits (default: false)"
     echo "  RALPH_EPIC_PUSH_REMOTE Remote to use for automatic epic pushes (default: current upstream)"
     echo "  RALPH_CONCURRENCY     Number of stories to process in parallel (default: 1)"
     echo "  RALPH_RUNTIME_ROOT    Shared runtime root for parallel worker state"
@@ -1540,6 +1560,7 @@ push_epic_changes() {
 update_story_status() {
     local story_key="$1"
     local new_status="$2"
+    local update_result=0
 
     log INFO "Updating status: $story_key -> $new_status"
 
@@ -1548,8 +1569,45 @@ update_story_status() {
         return 0
     fi
 
-    # Use yq to update the YAML file
-    yq -yi ".development_status.\"$story_key\" = \"$new_status\"" "$SPRINT_STATUS"
+    if command -v python3 >/dev/null 2>&1; then
+        python3 - "$SPRINT_STATUS" "$story_key" "$new_status" <<'PY' || update_result=$?
+from __future__ import annotations
+
+from datetime import datetime
+from pathlib import Path
+import re
+import sys
+
+
+status_path = Path(sys.argv[1])
+story_key = sys.argv[2]
+new_status = sys.argv[3]
+text = status_path.read_text(encoding="utf-8")
+
+status_pattern = re.compile(rf"^(\s*{re.escape(story_key)}:\s*).*$", re.MULTILINE)
+updated_text, replacements = status_pattern.subn(rf"\1{new_status}", text, count=1)
+if replacements == 0:
+    raise SystemExit(2)
+
+timestamp = datetime.now().astimezone().replace(microsecond=0).isoformat()
+last_updated_pattern = re.compile(r"^(last_updated:\s*)(['\"]?).*?\2\s*$", re.MULTILINE)
+
+def replace_last_updated(match: re.Match[str]) -> str:
+    quote = match.group(2)
+    return f"{match.group(1)}{quote}{timestamp}{quote}"
+
+updated_text, _ = last_updated_pattern.subn(replace_last_updated, updated_text, count=1)
+
+status_path.write_text(updated_text, encoding="utf-8")
+PY
+    else
+        update_result=2
+    fi
+
+    if [[ "$update_result" -ne 0 ]]; then
+        log WARN "Falling back to yq status update for $story_key; file formatting may change."
+        yq -yi ".development_status.\"$story_key\" = \"$new_status\"" "$SPRINT_STATUS"
+    fi
 
     log OK "Status updated: $story_key = $new_status"
 }
@@ -2187,6 +2245,14 @@ main() {
                 DRY_RUN=true
                 shift
                 ;;
+            --yes|-y)
+                ASSUME_YES=true
+                shift
+                ;;
+            --bell)
+                NOTIFY_BELL=true
+                shift
+                ;;
             --epic)
                 SPECIFIC_EPIC="$2"
                 shift 2
@@ -2296,6 +2362,7 @@ main() {
         echo ""
         echo "All stories are either completed or in progress."
         echo "Check sprint-status.yaml for current state."
+        notify_controller_completion
         exit 0
     fi
 
@@ -2308,10 +2375,11 @@ main() {
     done
     echo ""
 
-    if [[ "$DRY_RUN" == "false" ]]; then
+    if [[ "$DRY_RUN" == "false" && "$ASSUME_YES" != "true" ]]; then
         read -p "Proceed with implementation? [Y/n]: " confirm
         if [[ "$confirm" =~ ^[Nn] ]]; then
             log INFO "Aborted by user"
+            notify_controller_completion
             exit 0
         fi
     fi
@@ -2319,7 +2387,9 @@ main() {
     if parallel_mode_enabled; then
         log INFO "Parallel mode enabled (RALPH_CONCURRENCY=$CONCURRENCY)"
         run_parallel_stories "${stories[@]}"
-        return $?
+        local parallel_status=$?
+        notify_controller_completion
+        return "$parallel_status"
     fi
 
     # Process each story
@@ -2403,18 +2473,23 @@ main() {
     echo ""
 
     if [[ $failed -gt 0 ]]; then
+        notify_controller_completion
         exit 1
     fi
 
     if controller_stop_requested; then
         log WARN "Immediate stop completed."
+        notify_controller_completion
         exit 130
     fi
 
     if controller_shutdown_requested; then
         log WARN "Graceful shutdown completed after the current story finished."
+        notify_controller_completion
         exit 130
     fi
+
+    notify_controller_completion
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
