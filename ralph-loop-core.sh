@@ -74,6 +74,7 @@ DRY_RUN=false
 SPECIFIC_EPIC=""
 SPECIFIC_STORY=""
 SKIP_CODE_REVIEW=false
+SKIP_RETRO="${RALPH_SKIP_RETRO:-false}"
 VERBOSE=false
 
 # Provider selection (claude|codex)
@@ -148,6 +149,7 @@ usage() {
     echo "  --epic N            Process only stories from epic N"
     echo "  --story X-Y         Process specific story (e.g., 1-1)"
     echo "  --skip-review       Skip code-review step"
+    echo "  --skip-retro        Skip retrospective prompt when epics complete"
     echo "  --verbose           Show detailed agent output"
     echo "  --help              Show this help message"
     echo ""
@@ -161,6 +163,7 @@ usage() {
     echo "  RALPH_PROJECT_ROOT    Project root directory (default: current dir)"
     echo "  RALPH_SPRINT_STATUS   Path to sprint-status.yaml"
     echo "  RALPH_LOG_DIR         Directory for log files"
+    echo "  RALPH_SKIP_RETRO      Skip retrospective prompt (true/false)"
     if [[ "$PROVIDER" == "codex" ]]; then
         echo "  RALPH_CODEX_FULL_AUTO Use --full-auto with codex exec (default: true)"
         echo "  RALPH_CODEX_SANDBOX   Codex sandbox mode (e.g., danger-full-access)"
@@ -520,6 +523,11 @@ check_epic_completion() {
         log OK "Epic $epic_num completed! All stories are done."
         update_story_status "$epic_key" "done"
 
+        if [[ "$SKIP_RETRO" == "true" ]]; then
+            log INFO "Skipping retrospective prompt (--skip-retro)"
+            return 0
+        fi
+
         # Prompt for retrospective
         echo ""
         echo -e "${YELLOW}Would you like to run the retrospective for Epic $epic_num?${NC}"
@@ -554,6 +562,10 @@ main() {
                 ;;
             --skip-review)
                 SKIP_CODE_REVIEW=true
+                shift
+                ;;
+            --skip-retro)
+                SKIP_RETRO=true
                 shift
                 ;;
             --verbose)

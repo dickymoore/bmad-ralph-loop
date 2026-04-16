@@ -117,6 +117,7 @@ codex-ralph-loop [OPTIONS]
 | `--epic N` | Process only stories from epic N |
 | `--story X-Y` | Process a specific story (e.g., `1-2`) |
 | `--skip-review` | Skip the code-review step |
+| `--skip-retro` | Skip retrospective prompt when epics complete |
 | `--verbose` | Show detailed agent output |
 | `--help` | Display help message |
 
@@ -171,6 +172,7 @@ your-project/
 | `RALPH_PROJECT_ROOT` | Auto-detected | Project root directory |
 | `RALPH_SPRINT_STATUS` | `_bmad-output/implementation-artifacts/sprint-status.yaml` | Path to sprint status |
 | `RALPH_LOG_DIR` | `scripts/logs` | Directory for log files |
+| `RALPH_SKIP_RETRO` | `false` | Skip retrospective prompt when epics complete |
 
 ### Sprint Status Format
 

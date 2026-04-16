@@ -98,6 +98,7 @@ retrospectives:
 | `RALPH_PROJECT_ROOT` | Current directory | Project root path |
 | `RALPH_SPRINT_STATUS` | `_bmad-output/implementation-artifacts/sprint-status.yaml` | Sprint status file path |
 | `RALPH_LOG_DIR` | `logs/` | Directory for log files |
+| `RALPH_SKIP_RETRO` | `false` | Skip retrospective prompt when epics complete |
 | `RALPH_CODEX_FULL_AUTO` | `true` | Use `--full-auto` with Codex exec |
 | `RALPH_CODEX_SANDBOX` | *(empty)* | Codex sandbox mode (e.g., `danger-full-access`) |
 | `RALPH_CODEX_MODEL` | *(empty)* | Codex model override |
