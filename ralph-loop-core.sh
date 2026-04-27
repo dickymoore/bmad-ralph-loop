@@ -2237,16 +2237,6 @@ EOF
 }
 
 wait_for_worker_completion() {
-    local -n active_pids_ref="$1"
-    local -n active_stories_ref="$2"
-    local -n active_results_ref="$3"
-    local -n active_worktrees_ref="$4"
-    local -n active_branches_ref="$5"
-    local -n active_console_logs_ref="$6"
-    local -n processed_ref="$7"
-    local -n failed_ref="$8"
-    local -n deferred_ref="$9"
-
     local index=0
     local pid=0
     local wait_status=0
@@ -2266,17 +2256,17 @@ wait_for_worker_completion() {
         poll_controller_control_file
 
         if controller_stop_requested; then
-            for pid in "${active_pids_ref[@]}"; do
+            for pid in "${ACTIVE_WORKER_PIDS[@]}"; do
                 [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && force_stop_process_tree "$pid"
             done
         fi
 
-        for index in "${!active_pids_ref[@]}"; do
-            pid="${active_pids_ref[$index]}"
-            result_file="${active_results_ref[$index]}"
-            story_key="${active_stories_ref[$index]}"
-            branch_name="${active_branches_ref[$index]}"
-            worktree_dir="${active_worktrees_ref[$index]}"
+        for index in "${!ACTIVE_WORKER_PIDS[@]}"; do
+            pid="${ACTIVE_WORKER_PIDS[$index]}"
+            result_file="${ACTIVE_WORKER_RESULTS[$index]}"
+            story_key="${ACTIVE_WORKER_STORIES[$index]}"
+            branch_name="${ACTIVE_WORKER_BRANCHES[$index]}"
+            worktree_dir="${ACTIVE_WORKER_WORKTREES[$index]}"
             stale_worker="false"
             stop_requested="false"
 
@@ -2284,7 +2274,7 @@ wait_for_worker_completion() {
                 if controller_stop_requested; then
                     stop_requested="true"
                     force_stop_process_tree "$pid"
-                elif worker_is_stale "$result_file" "${active_console_logs_ref[$index]}"; then
+                elif worker_is_stale "$result_file" "${ACTIVE_WORKER_CONSOLE_LOGS[$index]}"; then
                     stale_worker="true"
                     log ERROR "Worker for $story_key exceeded the idle timeout (${WORKER_IDLE_TIMEOUT}s) with no new output. Terminating the worker so Ralph can continue."
                     force_stop_process_tree "$pid"
@@ -2304,7 +2294,7 @@ wait_for_worker_completion() {
 
             result_status="failed"
             result_commit_sha=""
-            result_log_file="${active_console_logs_ref[$index]}"
+            result_log_file="${ACTIVE_WORKER_CONSOLE_LOGS[$index]}"
 
             if [[ -f "$result_file" ]]; then
                 if validate_worker_result_file "$result_file"; then
@@ -2316,7 +2306,7 @@ wait_for_worker_completion() {
             fi
 
             if controller_stop_requested || [[ "$stop_requested" == "true" ]]; then
-                deferred_ref=$((deferred_ref + 1))
+                PARALLEL_DEFERRED=$((PARALLEL_DEFERRED + 1))
                 log WARN "Worker stopped for $story_key due to controller stop request. Authoritative status was left unchanged."
                 keep_checkout="$KEEP_WORKTREES_ON_FAILURE"
             elif [[ "$result_status" == "success" && "$result_exit_code" == "0" && "$wait_status" -ne 0 ]]; then
@@ -2328,18 +2318,18 @@ wait_for_worker_completion() {
                 :
             elif [[ "$wait_status" -eq 0 && "$result_status" == "success" ]]; then
                 if integrate_story_commit "$story_key" "$result_commit_sha" "$worktree_dir" "$branch_name"; then
-                    processed_ref=$((processed_ref + 1))
+                    PARALLEL_PROCESSED=$((PARALLEL_PROCESSED + 1))
                     check_epic_completion "$(get_epic_for_story "$story_key")" || {
-                        failed_ref=$((failed_ref + 1))
+                        PARALLEL_FAILED=$((PARALLEL_FAILED + 1))
                         log ERROR "Failed to finalize epic after integrating $story_key"
                     }
                     keep_checkout="$KEEP_WORKTREES_ON_SUCCESS"
                 else
-                    failed_ref=$((failed_ref + 1))
+                    PARALLEL_FAILED=$((PARALLEL_FAILED + 1))
                     keep_checkout="$KEEP_WORKTREES_ON_FAILURE"
                 fi
             else
-                failed_ref=$((failed_ref + 1))
+                PARALLEL_FAILED=$((PARALLEL_FAILED + 1))
                 if [[ "$stale_worker" == "true" ]]; then
                     log ERROR "Worker timed out waiting for new output: ${result_log_file:-$result_file}"
                 fi
@@ -2349,8 +2339,8 @@ wait_for_worker_completion() {
             fi
 
             cleanup_worker_checkout "$branch_name" "$worktree_dir" "$keep_checkout"
-            unset 'active_pids_ref[$index]' 'active_stories_ref[$index]' 'active_results_ref[$index]' \
-                'active_worktrees_ref[$index]' 'active_branches_ref[$index]' 'active_console_logs_ref[$index]'
+            unset 'ACTIVE_WORKER_PIDS[$index]' 'ACTIVE_WORKER_STORIES[$index]' 'ACTIVE_WORKER_RESULTS[$index]' \
+                'ACTIVE_WORKER_WORKTREES[$index]' 'ACTIVE_WORKER_BRANCHES[$index]' 'ACTIVE_WORKER_CONSOLE_LOGS[$index]'
             return 0
         done
 
@@ -2360,19 +2350,20 @@ wait_for_worker_completion() {
 
 run_parallel_stories() {
     local pending_stories=("$@")
-    local active_pids=()
-    local active_stories=()
-    local active_results=()
-    local active_worktrees=()
-    local active_branches=()
-    local active_console_logs=()
-    local processed=0
-    local failed=0
-    local deferred=0
     local launched_this_round=false
     local story_key=""
     local index=0
     local ready_found=false
+
+    ACTIVE_WORKER_PIDS=()
+    ACTIVE_WORKER_STORIES=()
+    ACTIVE_WORKER_RESULTS=()
+    ACTIVE_WORKER_WORKTREES=()
+    ACTIVE_WORKER_BRANCHES=()
+    ACTIVE_WORKER_CONSOLE_LOGS=()
+    PARALLEL_PROCESSED=0
+    PARALLEL_FAILED=0
+    PARALLEL_DEFERRED=0
 
     ensure_parallel_safe_worktree
     prepare_parallel_runtime
@@ -2381,7 +2372,7 @@ run_parallel_stories() {
         poll_controller_control_file
         launched_this_round=false
 
-        while [[ "$SHUTDOWN_REQUESTED" != "true" && "$CONTROL_PAUSED" != "true" && "$(count_entries "${active_pids[@]}")" -lt "$CONCURRENCY" ]]; do
+        while [[ "$SHUTDOWN_REQUESTED" != "true" && "$CONTROL_PAUSED" != "true" && "$(count_entries "${ACTIVE_WORKER_PIDS[@]}")" -lt "$CONCURRENCY" ]]; do
             ready_found=false
 
             for index in "${!pending_stories[@]}"; do
@@ -2397,51 +2388,51 @@ run_parallel_stories() {
             fi
 
             if launch_story_worker "$story_key"; then
-                active_pids+=("$LAUNCHED_WORKER_PID")
-                active_stories+=("$story_key")
-                active_results+=("$LAUNCHED_WORKER_RESULT_FILE")
-                active_worktrees+=("$LAUNCHED_WORKER_WORKTREE")
-                active_branches+=("$LAUNCHED_WORKER_BRANCH")
-                active_console_logs+=("$LAUNCHED_WORKER_CONSOLE_LOG")
+                ACTIVE_WORKER_PIDS+=("$LAUNCHED_WORKER_PID")
+                ACTIVE_WORKER_STORIES+=("$story_key")
+                ACTIVE_WORKER_RESULTS+=("$LAUNCHED_WORKER_RESULT_FILE")
+                ACTIVE_WORKER_WORKTREES+=("$LAUNCHED_WORKER_WORKTREE")
+                ACTIVE_WORKER_BRANCHES+=("$LAUNCHED_WORKER_BRANCH")
+                ACTIVE_WORKER_CONSOLE_LOGS+=("$LAUNCHED_WORKER_CONSOLE_LOG")
                 unset 'pending_stories[$index]'
                 launched_this_round=true
             else
-                failed=$((failed + 1))
+                PARALLEL_FAILED=$((PARALLEL_FAILED + 1))
                 log ERROR "Failed to launch worker for $story_key"
                 unset 'pending_stories[$index]'
             fi
         done
 
-        if controller_stop_requested && [[ "$(count_entries "${active_pids[@]}")" -eq 0 ]]; then
-            deferred=$((deferred + $(count_entries "${pending_stories[@]}")))
+        if controller_stop_requested && [[ "$(count_entries "${ACTIVE_WORKER_PIDS[@]}")" -eq 0 ]]; then
+            PARALLEL_DEFERRED=$((PARALLEL_DEFERRED + $(count_entries "${pending_stories[@]}")))
             break
         fi
 
-        if [[ "$(count_entries "${active_pids[@]}")" -eq 0 && "$(count_entries "${pending_stories[@]}")" -eq 0 ]]; then
+        if [[ "$(count_entries "${ACTIVE_WORKER_PIDS[@]}")" -eq 0 && "$(count_entries "${pending_stories[@]}")" -eq 0 ]]; then
             break
         fi
 
-        if controller_shutdown_requested && [[ "$(count_entries "${active_pids[@]}")" -eq 0 ]]; then
-            deferred=$((deferred + $(count_entries "${pending_stories[@]}")))
+        if controller_shutdown_requested && [[ "$(count_entries "${ACTIVE_WORKER_PIDS[@]}")" -eq 0 ]]; then
+            PARALLEL_DEFERRED=$((PARALLEL_DEFERRED + $(count_entries "${pending_stories[@]}")))
             break
         fi
 
-        if controller_paused && [[ "$(count_entries "${active_pids[@]}")" -eq 0 ]] && [[ "$(count_entries "${pending_stories[@]}")" -gt 0 ]]; then
+        if controller_paused && [[ "$(count_entries "${ACTIVE_WORKER_PIDS[@]}")" -eq 0 ]] && [[ "$(count_entries "${pending_stories[@]}")" -gt 0 ]]; then
             wait_while_controller_paused
             continue
         fi
 
-        if [[ "$(count_entries "${active_pids[@]}")" -eq 0 && "$(count_entries "${pending_stories[@]}")" -gt 0 ]]; then
+        if [[ "$(count_entries "${ACTIVE_WORKER_PIDS[@]}")" -eq 0 && "$(count_entries "${pending_stories[@]}")" -gt 0 ]]; then
             log ERROR "No runnable stories remain; unresolved dependencies are blocking progress:"
             for story_key in "${pending_stories[@]}"; do
                 [[ -n "$story_key" ]] && echo "  - $story_key"
             done
-            failed=$((failed + $(count_entries "${pending_stories[@]}")))
+            PARALLEL_FAILED=$((PARALLEL_FAILED + $(count_entries "${pending_stories[@]}")))
             break
         fi
 
-        if [[ "$launched_this_round" == "true" || "$(count_entries "${active_pids[@]}")" -gt 0 ]]; then
-            wait_for_worker_completion active_pids active_stories active_results active_worktrees active_branches active_console_logs processed failed deferred
+        if [[ "$launched_this_round" == "true" || "$(count_entries "${ACTIVE_WORKER_PIDS[@]}")" -gt 0 ]]; then
+            wait_for_worker_completion
         fi
     done
 
@@ -2450,27 +2441,27 @@ run_parallel_stories() {
     echo -e "${GREEN}                  Implementation Summary${NC}"
     echo -e "${CYAN}============================================================${NC}"
     echo ""
-    echo -e "  ${GREEN}[+] Processed:${NC} $processed stories"
-    if [[ $failed -gt 0 ]]; then
-        echo -e "  ${RED}[x] Failed:${NC}    $failed stories"
+    echo -e "  ${GREEN}[+] Processed:${NC} $PARALLEL_PROCESSED stories"
+    if [[ $PARALLEL_FAILED -gt 0 ]]; then
+        echo -e "  ${RED}[x] Failed:${NC}    $PARALLEL_FAILED stories"
     fi
-    if [[ $deferred -gt 0 ]]; then
-        echo -e "  ${YELLOW}[!] Deferred:${NC}  $deferred stories"
+    if [[ $PARALLEL_DEFERRED -gt 0 ]]; then
+        echo -e "  ${YELLOW}[!] Deferred:${NC}  $PARALLEL_DEFERRED stories"
     fi
     echo -e "  ${BLUE}[i] Log:${NC}       $LOG_FILE"
     echo ""
 
-    if [[ $failed -gt 0 ]]; then
+    if [[ $PARALLEL_FAILED -gt 0 ]]; then
         return 1
     fi
 
     if controller_stop_requested; then
-        log WARN "Stop completed. Active work was terminated and ${deferred} story/stories remain pending."
+        log WARN "Stop completed. Active work was terminated and ${PARALLEL_DEFERRED} story/stories remain pending."
         return 130
     fi
 
     if controller_shutdown_requested; then
-        log WARN "Graceful shutdown completed after draining active workers. ${deferred} story/stories remain pending."
+        log WARN "Graceful shutdown completed after draining active workers. ${PARALLEL_DEFERRED} story/stories remain pending."
         return 130
     fi
 
