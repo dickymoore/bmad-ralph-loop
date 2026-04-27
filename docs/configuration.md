@@ -112,6 +112,7 @@ retrospectives:
 | `RALPH_WORKFLOW_IDLE_TIMEOUT` | `7200` | Fail a provider workflow after this many idle seconds without new output |
 | `RALPH_WORKER_IDLE_TIMEOUT` | `10800` | Fail a parallel worker after this many idle seconds without new output |
 | `RALPH_CONTROL_FILE` | `$RALPH_RUNTIME_ROOT/control` | Runtime control file for `pause`, `resume`, `drain`, or `stop` |
+| `RALPH_NOTIFY_BELL` | `false` | Ring the terminal bell when the controller exits |
 | `RALPH_CODEX_FULL_AUTO` | `true` | Use `--full-auto` with Codex exec |
 | `RALPH_CODEX_SANDBOX` | *(empty)* | Codex sandbox mode (e.g., `danger-full-access`) |
 | `RALPH_CODEX_MODEL` | *(empty)* | Codex model override |

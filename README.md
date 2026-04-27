@@ -116,6 +116,8 @@ codex-ralph-loop [OPTIONS]
 | Flag | Description |
 |------|-------------|
 | `--dry-run` | Preview actions without executing |
+| `--yes`, `-y` | Skip the `Proceed with implementation?` confirmation prompt |
+| `--bell` | Ring the terminal bell when the controller exits |
 | `--epic N` | Process only stories from epic N |
 | `--story X-Y` | Process a specific story (e.g., `1-2`) |
 | `--skip-review` | Skip the code-review step |
@@ -130,6 +132,12 @@ claude-ralph-loop
 
 # Preview what would happen
 claude-ralph-loop --dry-run
+
+# Run without the confirmation prompt
+claude-ralph-loop --yes
+
+# Ring the terminal bell when Ralph finishes
+claude-ralph-loop --bell
 
 # Process only Epic 2 stories
 claude-ralph-loop --epic 2
@@ -190,6 +198,7 @@ your-project/
 | `RALPH_WORKFLOW_IDLE_TIMEOUT` | `7200` | Fail a provider workflow after this many idle seconds with no new output |
 | `RALPH_WORKER_IDLE_TIMEOUT` | `10800` | Fail a parallel worker after this many idle seconds with no new output |
 | `RALPH_CONTROL_FILE` | `$RALPH_RUNTIME_ROOT/control` | Runtime control file for `pause`, `resume`, `drain`, or `stop` |
+| `RALPH_NOTIFY_BELL` | `false` | Ring the terminal bell when the controller exits |
 
 ### Sprint Status Format
 

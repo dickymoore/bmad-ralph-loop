@@ -28,3 +28,6 @@ _bmad-output/
 
 # Node modules (if any future dependencies)
 node_modules/
+
+# Codex generated files
+.codex/

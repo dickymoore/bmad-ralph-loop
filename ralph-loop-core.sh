@@ -100,8 +100,10 @@ CODEX_FULL_AUTO="${RALPH_CODEX_FULL_AUTO:-true}"
 CODEX_SANDBOX="${RALPH_CODEX_SANDBOX:-}"
 CODEX_MODEL="${RALPH_CODEX_MODEL:-}"
 CODEX_SEARCH="${RALPH_CODEX_SEARCH:-false}"
+WORKFLOW_RETRY_LIMIT="${RALPH_WORKFLOW_RETRY_LIMIT:-2}"
 AUTO_RETROSPECTIVE="${RALPH_AUTO_RETROSPECTIVE:-true}"
 MAX_REVIEW_PASSES="${RALPH_MAX_REVIEW_PASSES:-5}"
+REVIEW_REPEAT_LIMIT="${RALPH_REVIEW_REPEAT_LIMIT:-2}"
 PROMPT_ON_FAILURE="${RALPH_PROMPT_ON_FAILURE:-false}"
 AUTO_PUSH_EPIC="${RALPH_AUTO_PUSH_EPIC:-true}"
 NOTIFY_BELL="${RALPH_NOTIFY_BELL:-$NOTIFY_BELL}"
@@ -214,6 +216,7 @@ usage() {
     echo "  RALPH_LOG_DIR         Directory for log files"
     echo "  RALPH_AUTO_RETROSPECTIVE Automatically run retrospective on epic completion (default: true)"
     echo "  RALPH_MAX_REVIEW_PASSES Maximum review/dev loops before aborting (default: 5)"
+    echo "  RALPH_REVIEW_REPEAT_LIMIT Consecutive identical review findings before aborting as looped churn (default: 2)"
     echo "  RALPH_PROMPT_ON_FAILURE Prompt before continuing after failures (default: false)"
     echo "  RALPH_AUTO_PUSH_EPIC  Push the current branch when an epic completes (default: true)"
     echo "  RALPH_NOTIFY_BELL    Ring the terminal bell when the controller exits (default: false)"
@@ -343,6 +346,16 @@ validate_numeric_setting() {
         log ERROR "$name must be a non-negative integer (got: $value)"
         exit 1
     fi
+}
+
+is_transient_provider_failure() {
+    local capture_file="$1"
+
+    [[ -f "$capture_file" ]] || return 1
+
+    grep -Eqi \
+        "ERROR: Reconnecting|temporary errors|currently experiencing high demand|timed out|ECONNRESET|connection reset|rate limit|429|502|503|504" \
+        "$capture_file"
 }
 
 bash_supports_parallel_mode() {
@@ -1105,9 +1118,19 @@ run_agent_workflow() {
     fi
 
     # Build the prompt for the agent
-    local prompt="Load the $agent agent and execute the $workflow workflow. $extra_context
+    local prompt="Load the $agent agent and execute the $workflow workflow. $extra_context"
+
+    if [[ "$workflow" == "code-review" ]]; then
+        prompt="$prompt
+
+CRITICAL: Run in fully autonomous mode. Do NOT ask questions or wait for user input. Choose reasonable defaults when options are presented. Complete the entire workflow without stopping for confirmations.
+
+REVIEW MODE: This is a read-only review gate. Do NOT modify repository files, story files, sprint tracking files, or generated artifacts during review. Inspect the current implementation, report whether another dev pass is required, and finish with the required RALPH_REVIEW_RESULT line."
+    else
+        prompt="$prompt
 
 CRITICAL: Run in fully autonomous mode. Do NOT ask questions or wait for user input. Auto-fix any issues found. Choose reasonable defaults when options are presented. Complete the entire workflow without stopping for confirmations."
+    fi
 
     if [[ "$workflow" == "code-review" ]]; then
         prompt="$prompt
@@ -1119,46 +1142,81 @@ REVIEW LOOP CONTRACT:
     fi
 
     local exit_code=0
+    local max_attempts=1
+    local attempt=1
+    local tmp_capture=""
+    local effective_capture_file="$capture_file"
 
-    # Run provider with the workflow
-    case "$PROVIDER" in
-        claude)
-            local claude_cmd=("claude" "--print" "--dangerously-skip-permissions" "$prompt")
+    if [[ "$PROVIDER" == "codex" && "$WORKFLOW_RETRY_LIMIT" -gt 0 ]]; then
+        max_attempts=$((WORKFLOW_RETRY_LIMIT + 1))
+    fi
 
-            if run_command_with_watchdog "$workflow" "$capture_file" "${claude_cmd[@]}"; then
-                exit_code=0
-            else
-                exit_code=$?
-            fi
-            ;;
-        codex)
-            local codex_args=("exec")
+    if [[ -z "$effective_capture_file" ]]; then
+        tmp_capture="$(mktemp "${TMPDIR:-/tmp}/ralph-workflow-${workflow}.XXXXXX")"
+        effective_capture_file="$tmp_capture"
+    fi
 
-            if [[ "$CODEX_FULL_AUTO" == "true" ]]; then
-                codex_args+=("--full-auto")
-            fi
+    while true; do
+        # Run provider with the workflow
+        case "$PROVIDER" in
+            claude)
+                local claude_cmd=("claude" "--print" "--dangerously-skip-permissions" "$prompt")
 
-            if [[ "$CODEX_SEARCH" == "true" ]]; then
-                codex_args+=("--search")
-            fi
+                if run_command_with_watchdog "$workflow" "$effective_capture_file" "${claude_cmd[@]}"; then
+                    exit_code=0
+                else
+                    exit_code=$?
+                fi
+                ;;
+            codex)
+                local codex_args=("exec")
 
-            if [[ -n "$CODEX_SANDBOX" ]]; then
-                codex_args+=("--sandbox" "$CODEX_SANDBOX")
-            fi
+                if [[ "$CODEX_FULL_AUTO" == "true" ]]; then
+                    codex_args+=("--full-auto")
+                fi
 
-            if [[ -n "$CODEX_MODEL" ]]; then
-                codex_args+=("--model" "$CODEX_MODEL")
-            fi
+                if [[ "$CODEX_SEARCH" == "true" ]]; then
+                    codex_args+=("--search")
+                fi
 
-            local codex_cmd=("codex" "${codex_args[@]}" "$prompt")
+                if [[ -n "$CODEX_SANDBOX" ]]; then
+                    codex_args+=("--sandbox" "$CODEX_SANDBOX")
+                fi
 
-            if run_command_with_watchdog "$workflow" "$capture_file" "${codex_cmd[@]}"; then
-                exit_code=0
-            else
-                exit_code=$?
-            fi
-            ;;
-    esac
+                if [[ -n "$CODEX_MODEL" ]]; then
+                    codex_args+=("--model" "$CODEX_MODEL")
+                fi
+
+                local codex_cmd=("codex" "${codex_args[@]}" "$prompt")
+
+                if run_command_with_watchdog "$workflow" "$effective_capture_file" "${codex_cmd[@]}"; then
+                    exit_code=0
+                else
+                    exit_code=$?
+                fi
+                ;;
+        esac
+
+        if [[ $exit_code -eq 0 ]]; then
+            break
+        fi
+
+        if [[ "$PROVIDER" != "codex" || "$attempt" -ge "$max_attempts" ]]; then
+            break
+        fi
+
+        if ! is_transient_provider_failure "$effective_capture_file"; then
+            break
+        fi
+
+        log WARN "Transient provider failure detected for $workflow (attempt $attempt/$max_attempts). Retrying..."
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+
+    if [[ -n "$tmp_capture" ]]; then
+        rm -f "$tmp_capture"
+    fi
 
     if [[ $exit_code -eq 0 ]]; then
         log OK "Workflow completed: $workflow"
@@ -1247,13 +1305,54 @@ extract_review_result() {
     esac
 }
 
+extract_review_findings_text() {
+    local capture_file="$1"
+
+    awk '
+        /RALPH_REVIEW_RESULT=/ { exit }
+        /^\*\*Findings\*\*$/ { capture=1 }
+        capture == 0 && /^[[:space:]]*[0-9]+\.[[:space:]]+(High|Medium|Low):/ { capture=1 }
+        capture == 1 {
+            if ($0 ~ /^hook: Stop/) {
+                exit
+            }
+            print
+        }
+    ' "$capture_file"
+}
+
+capture_review_findings_fingerprint() {
+    local capture_file="$1"
+    local findings_text=""
+
+    findings_text="$(extract_review_findings_text "$capture_file")"
+    [[ -n "$findings_text" ]] || return 0
+
+    printf '%s\n' "$findings_text" \
+        | sed -E \
+            -e 's/\[[^]]+\]\([^)]*\)/LINK/g' \
+            -e 's#/home/[^ )]+#PATH#g' \
+            -e 's/[0-9]+/N/g' \
+            -e 's/[[:space:]]+/ /g' \
+            -e 's/^ //g' \
+            -e 's/ $//g' \
+        | hash_stream
+}
+
 code_review_requires_dev() {
     local story_key="$1"
     local review_pass="$2"
+    local previous_review_fingerprint="${3:-}"
+    local previous_repeat_count="${4:-0}"
     local before_fingerprint=""
     local after_fingerprint=""
     local review_capture=""
     local review_result=""
+    local review_findings_fingerprint=""
+
+    REVIEW_LOOP_LAST_FINGERPRINT=""
+    REVIEW_LOOP_REPEAT_COUNT=0
+    REVIEW_LOOP_STUCK=false
 
     before_fingerprint="$(capture_worktree_fingerprint)"
     review_capture="$(mktemp "${TMPDIR:-/tmp}/ralph-review-${story_key}-${review_pass}.XXXXXX")"
@@ -1265,7 +1364,22 @@ code_review_requires_dev() {
 
     after_fingerprint="$(capture_worktree_fingerprint)"
     review_result="$(extract_review_result "$review_capture")"
+    review_findings_fingerprint="$(capture_review_findings_fingerprint "$review_capture")"
     rm -f "$review_capture"
+
+    REVIEW_LOOP_LAST_FINGERPRINT="$review_findings_fingerprint"
+    if [[ -n "$review_findings_fingerprint" && "$review_findings_fingerprint" == "$previous_review_fingerprint" ]]; then
+        REVIEW_LOOP_REPEAT_COUNT=$((previous_repeat_count + 1))
+    else
+        REVIEW_LOOP_REPEAT_COUNT=1
+    fi
+
+    if [[ -n "$review_findings_fingerprint" && "$review_result" == "changes-required" && "$REVIEW_LOOP_REPEAT_COUNT" -ge "$REVIEW_REPEAT_LIMIT" ]]; then
+        REVIEW_LOOP_STUCK=true
+        log ERROR "Code review findings repeated $REVIEW_LOOP_REPEAT_COUNT consecutive pass(es) for $story_key. Likely stuck in a review loop."
+        log ERROR "Inspect the latest review findings before re-running dev-story."
+        return 3
+    fi
 
     if [[ "$before_fingerprint" != "$after_fingerprint" ]]; then
         if [[ "$review_result" == "clean" ]]; then
@@ -1620,6 +1734,30 @@ get_story_status() {
     fi
 }
 
+resolve_story_key() {
+    local selector="$1"
+    local exact_match=""
+    local prefix_matches=()
+    local line=""
+
+    exact_match="$(yq -r ".development_status.\"$selector\"" "$SPRINT_STATUS" 2>/dev/null || true)"
+    if [[ -n "$exact_match" && "$exact_match" != "null" ]]; then
+        echo "$selector"
+        return 0
+    fi
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && prefix_matches+=("$line")
+    done < <(yq -r ".development_status | keys | .[] | select(test(\"^${selector}-\"))" "$SPRINT_STATUS" 2>/dev/null)
+
+    if [[ "${#prefix_matches[@]}" -eq 1 ]]; then
+        echo "${prefix_matches[0]}"
+        return 0
+    fi
+
+    return 1
+}
+
 get_pending_stories() {
     # Get all stories with status: backlog, ready-for-dev, or review
     # Filter out epic entries and retrospectives
@@ -1640,6 +1778,10 @@ process_story() {
     local retry_context_prompt=""
     local create_story_context=""
     local dev_story_context=""
+    local before_fingerprint=""
+    local after_fingerprint=""
+    local previous_review_fingerprint=""
+    local repeated_review_count=0
 
     retry_context_prompt="$(get_retry_context_prompt)"
     create_story_context="The story to create is $story_key from Epic $epic_num."
@@ -1665,7 +1807,10 @@ process_story() {
     # Step 1: Create Story (SM agent)
     if [[ "$current_status" == "backlog" ]]; then
         log STEP "[1/3] Creating story file..."
-        run_agent_workflow "SM" "create-story" "Create story file for $story_key" "$create_story_context"
+        if ! run_agent_workflow "SM" "create-story" "Create story file for $story_key" "$create_story_context"; then
+            log ERROR "Aborting: create-story failed for $story_key"
+            return 1
+        fi
 
         if [[ "$DRY_RUN" == "true" ]]; then
             log INFO "[1/3] Dry run: skipping story file verification and status update"
@@ -1691,9 +1836,17 @@ process_story() {
                 log INFO "Re-entering dev-story after code review feedback (next pass: $((review_pass + 1)))"
             fi
             log STEP "[2/3] Implementing story..."
-            run_agent_workflow "DEV" "dev-story" "Implement story $story_key" "$dev_story_context"
+            before_fingerprint="$(capture_worktree_fingerprint)"
+            if ! run_agent_workflow "DEV" "dev-story" "Implement story $story_key" "$dev_story_context"; then
+                log ERROR "Aborting: dev-story failed for $story_key"
+                return 1
+            fi
+            after_fingerprint="$(capture_worktree_fingerprint)"
 
             verify_implementation "$story_key"
+            if [[ "$before_fingerprint" == "$after_fingerprint" ]]; then
+                log WARN "No repository changes detected during dev-story for $story_key"
+            fi
 
             update_story_status "$story_key" "review"
             current_status="review"
@@ -1704,22 +1857,36 @@ process_story() {
         # Step 3: Code Review (DEV agent)
         if [[ "$current_status" == "review" && "$SKIP_CODE_REVIEW" == "false" ]]; then
             local review_outcome=0
-            review_pass=$((review_pass + 1))
-            if [[ "$review_pass" -gt "$MAX_REVIEW_PASSES" ]]; then
-                log ERROR "Review loop exceeded $MAX_REVIEW_PASSES pass(es) for $story_key"
+            local next_review_pass=0
+            local review_cap_with_final_verification=0
+
+            next_review_pass=$((review_pass + 1))
+            review_cap_with_final_verification=$((MAX_REVIEW_PASSES + 1))
+
+            if [[ "$next_review_pass" -gt "$review_cap_with_final_verification" ]]; then
+                log ERROR "Review loop exceeded $MAX_REVIEW_PASSES pass(es) plus one final verification review for $story_key"
                 log ERROR "Inspect the workflow output or raise RALPH_MAX_REVIEW_PASSES if the loop is intentional."
                 return 1
             fi
 
+            review_pass="$next_review_pass"
             log STEP "[3/3] Running code review (pass $review_pass/$MAX_REVIEW_PASSES)..."
-            if code_review_requires_dev "$story_key" "$review_pass"; then
+            if code_review_requires_dev "$story_key" "$review_pass" "$previous_review_fingerprint" "$repeated_review_count"; then
                 review_outcome=0
             else
                 review_outcome=$?
             fi
 
+            previous_review_fingerprint="$REVIEW_LOOP_LAST_FINGERPRINT"
+            repeated_review_count="$REVIEW_LOOP_REPEAT_COUNT"
+
             case "$review_outcome" in
                 0)
+                    if [[ "$review_pass" -gt "$MAX_REVIEW_PASSES" ]]; then
+                        log ERROR "Final verification review still requested another dev pass for $story_key after $MAX_REVIEW_PASSES completed review cycle(s)."
+                        log ERROR "Inspect the latest review findings before continuing."
+                        return 1
+                    fi
                     update_story_status "$story_key" "ready-for-dev"
                     current_status="ready-for-dev"
                     continue
@@ -1727,6 +1894,10 @@ process_story() {
                 1)
                     update_story_status "$story_key" "done"
                     current_status="done"
+                    ;;
+                3)
+                    log ERROR "Aborting: repeated review findings indicate looped churn for $story_key"
+                    return 1
                     ;;
                 *)
                     log ERROR "Aborting: code review failed for $story_key"
@@ -1778,7 +1949,10 @@ check_epic_completion() {
 
         if [[ "$AUTO_RETROSPECTIVE" == "true" ]]; then
             log INFO "Running retrospective automatically for Epic $epic_num"
-            run_agent_workflow "SM" "retrospective" "Run retrospective for Epic $epic_num"
+            if ! run_agent_workflow "SM" "retrospective" "Run retrospective for Epic $epic_num"; then
+                log ERROR "Retrospective failed for Epic $epic_num"
+                return 1
+            fi
             update_story_status "${epic_key}-retrospective" "done"
         else
             log INFO "Skipping retrospective for Epic $epic_num (RALPH_AUTO_RETROSPECTIVE=false)"
@@ -2282,6 +2456,7 @@ main() {
 
     validate_numeric_setting "RALPH_CONCURRENCY" "$CONCURRENCY"
     validate_numeric_setting "RALPH_MAX_REVIEW_PASSES" "$MAX_REVIEW_PASSES"
+    validate_numeric_setting "RALPH_REVIEW_REPEAT_LIMIT" "$REVIEW_REPEAT_LIMIT"
     validate_numeric_setting "RALPH_WORKFLOW_IDLE_TIMEOUT" "$WORKFLOW_IDLE_TIMEOUT"
     validate_numeric_setting "RALPH_WORKER_IDLE_TIMEOUT" "$WORKER_IDLE_TIMEOUT"
 
@@ -2332,8 +2507,13 @@ main() {
     local stories=()
 
     if [[ -n "$SPECIFIC_STORY" ]]; then
-        stories=("$SPECIFIC_STORY")
-        log INFO "Processing single story: $SPECIFIC_STORY"
+        local resolved_story=""
+        if ! resolved_story="$(resolve_story_key "$SPECIFIC_STORY")"; then
+            log ERROR "Could not resolve story selector '$SPECIFIC_STORY' to a unique story key in $SPRINT_STATUS"
+            exit 1
+        fi
+        stories=("$resolved_story")
+        log INFO "Processing single story: $resolved_story (requested: $SPECIFIC_STORY)"
     elif [[ -n "$SPECIFIC_EPIC" ]]; then
         stories=()
         while IFS= read -r line; do
