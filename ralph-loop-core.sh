@@ -930,14 +930,12 @@ prepare_retry_context() {
 
     previous_result_file="$previous_result_dir/result.env"
     if [[ -f "$previous_result_file" ]]; then
-        unset RALPH_WORKER_RESULT_STATUS RALPH_WORKER_RESULT_COMMIT_SHA
-        unset RALPH_WORKER_RESULT_LOG_FILE RALPH_WORKER_RESULT_WORKTREE
-        # shellcheck disable=SC1090
-        source "$previous_result_file"
-        previous_result_status="${RALPH_WORKER_RESULT_STATUS:-unknown}"
-        previous_commit_sha="${RALPH_WORKER_RESULT_COMMIT_SHA:-}"
-        previous_log_file="${RALPH_WORKER_RESULT_LOG_FILE:-}"
-        previous_worktree="${RALPH_WORKER_RESULT_WORKTREE:-}"
+        if validate_worker_result_file "$previous_result_file"; then
+            previous_result_status="$(read_worker_result_value "$previous_result_file" "RALPH_WORKER_RESULT_STATUS" "unknown")"
+            previous_commit_sha="$(read_worker_result_value "$previous_result_file" "RALPH_WORKER_RESULT_COMMIT_SHA" "")"
+            previous_log_file="$(read_worker_result_value "$previous_result_file" "RALPH_WORKER_RESULT_LOG_FILE" "")"
+            previous_worktree="$(read_worker_result_value "$previous_result_file" "RALPH_WORKER_RESULT_WORKTREE" "")"
+        fi
     fi
 
     if [[ -z "$previous_worktree" ]]; then
@@ -1062,6 +1060,81 @@ mark_epic_in_progress_for_story() {
     fi
 }
 
+worker_result_key_allowed() {
+    case "$1" in
+        RALPH_WORKER_RESULT_STATUS|\
+        RALPH_WORKER_RESULT_STORY|\
+        RALPH_WORKER_RESULT_BRANCH|\
+        RALPH_WORKER_RESULT_WORKTREE|\
+        RALPH_WORKER_RESULT_EXIT_CODE|\
+        RALPH_WORKER_RESULT_COMMIT_SHA|\
+        RALPH_WORKER_RESULT_LOG_FILE)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+sanitize_worker_result_value() {
+    local value="$1"
+
+    value="${value//$'\r'/ }"
+    value="${value//$'\n'/ }"
+    printf '%s' "$value"
+}
+
+write_worker_result_field() {
+    local key="$1"
+    local value="$2"
+
+    printf '%s=%s\n' "$key" "$(sanitize_worker_result_value "$value")"
+}
+
+validate_worker_result_file() {
+    local result_file="$1"
+    local line=""
+    local key=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+
+        if [[ "$line" != *=* ]]; then
+            log WARN "Ignoring malformed worker result file: $result_file"
+            return 1
+        fi
+
+        key="${line%%=*}"
+        if ! worker_result_key_allowed "$key"; then
+            log WARN "Ignoring worker result file with unexpected key '$key': $result_file"
+            return 1
+        fi
+    done < "$result_file"
+
+    return 0
+}
+
+read_worker_result_value() {
+    local result_file="$1"
+    local wanted_key="$2"
+    local default_value="${3:-}"
+    local line=""
+    local key=""
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" ]] && continue
+        key="${line%%=*}"
+
+        if [[ "$key" == "$wanted_key" ]]; then
+            printf '%s' "${line#*=}"
+            return 0
+        fi
+    done < "$result_file"
+
+    printf '%s' "$default_value"
+    return 1
+}
+
 write_worker_result() {
     local result_file="$1"
     local result_status="$2"
@@ -1075,13 +1148,13 @@ write_worker_result() {
     mkdir -p "$(dirname "$result_file")"
 
     {
-        printf 'RALPH_WORKER_RESULT_STATUS=%q\n' "$result_status"
-        printf 'RALPH_WORKER_RESULT_STORY=%q\n' "$story_key"
-        printf 'RALPH_WORKER_RESULT_BRANCH=%q\n' "$branch_name"
-        printf 'RALPH_WORKER_RESULT_WORKTREE=%q\n' "$worktree_dir"
-        printf 'RALPH_WORKER_RESULT_EXIT_CODE=%q\n' "$exit_code"
-        printf 'RALPH_WORKER_RESULT_COMMIT_SHA=%q\n' "$commit_sha"
-        printf 'RALPH_WORKER_RESULT_LOG_FILE=%q\n' "$worker_log_file"
+        write_worker_result_field "RALPH_WORKER_RESULT_STATUS" "$result_status"
+        write_worker_result_field "RALPH_WORKER_RESULT_STORY" "$story_key"
+        write_worker_result_field "RALPH_WORKER_RESULT_BRANCH" "$branch_name"
+        write_worker_result_field "RALPH_WORKER_RESULT_WORKTREE" "$worktree_dir"
+        write_worker_result_field "RALPH_WORKER_RESULT_EXIT_CODE" "$exit_code"
+        write_worker_result_field "RALPH_WORKER_RESULT_COMMIT_SHA" "$commit_sha"
+        write_worker_result_field "RALPH_WORKER_RESULT_LOG_FILE" "$worker_log_file"
     } > "$result_file"
 }
 
@@ -2234,15 +2307,12 @@ wait_for_worker_completion() {
             result_log_file="${active_console_logs_ref[$index]}"
 
             if [[ -f "$result_file" ]]; then
-                unset RALPH_WORKER_RESULT_STATUS RALPH_WORKER_RESULT_STORY RALPH_WORKER_RESULT_BRANCH
-                unset RALPH_WORKER_RESULT_WORKTREE RALPH_WORKER_RESULT_EXIT_CODE RALPH_WORKER_RESULT_COMMIT_SHA
-                unset RALPH_WORKER_RESULT_LOG_FILE
-                # shellcheck disable=SC1090
-                source "$result_file"
-                result_status="${RALPH_WORKER_RESULT_STATUS:-failed}"
-                result_exit_code="${RALPH_WORKER_RESULT_EXIT_CODE:-}"
-                result_commit_sha="${RALPH_WORKER_RESULT_COMMIT_SHA:-}"
-                result_log_file="${RALPH_WORKER_RESULT_LOG_FILE:-$result_log_file}"
+                if validate_worker_result_file "$result_file"; then
+                    result_status="$(read_worker_result_value "$result_file" "RALPH_WORKER_RESULT_STATUS" "failed")"
+                    result_exit_code="$(read_worker_result_value "$result_file" "RALPH_WORKER_RESULT_EXIT_CODE" "")"
+                    result_commit_sha="$(read_worker_result_value "$result_file" "RALPH_WORKER_RESULT_COMMIT_SHA" "")"
+                    result_log_file="$(read_worker_result_value "$result_file" "RALPH_WORKER_RESULT_LOG_FILE" "$result_log_file")"
+                fi
             fi
 
             if controller_stop_requested || [[ "$stop_requested" == "true" ]]; then
