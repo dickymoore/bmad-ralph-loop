@@ -21,6 +21,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CORE_SCRIPT="ralph-loop-core.sh"
 CLAUDE_SCRIPT="claude-ralph-loop.sh"
 CODEX_SCRIPT="codex-ralph-loop.sh"
+LIB_DIR="lib"
+INSTALLED_LIB_DIR="ralph-loop-lib"
 CLAUDE_BINARY="claude-ralph-loop"
 CODEX_BINARY="codex-ralph-loop"
 
@@ -173,11 +175,17 @@ if [[ "$NEED_SUDO" == "true" ]]; then
     sudo cp "$SCRIPT_DIR/$CORE_SCRIPT" "$INSTALL_DIR/$CORE_SCRIPT"
     sudo cp "$SCRIPT_DIR/$CLAUDE_SCRIPT" "$INSTALL_DIR/$CLAUDE_BINARY"
     sudo cp "$SCRIPT_DIR/$CODEX_SCRIPT" "$INSTALL_DIR/$CODEX_BINARY"
+    sudo rm -rf "$INSTALL_DIR/$INSTALLED_LIB_DIR"
+    sudo mkdir -p "$INSTALL_DIR/$INSTALLED_LIB_DIR"
+    sudo cp "$SCRIPT_DIR/$LIB_DIR/"*.sh "$INSTALL_DIR/$INSTALLED_LIB_DIR/"
     sudo chmod +x "$INSTALL_DIR/$CLAUDE_BINARY" "$INSTALL_DIR/$CODEX_BINARY"
 else
     cp "$SCRIPT_DIR/$CORE_SCRIPT" "$INSTALL_DIR/$CORE_SCRIPT"
     cp "$SCRIPT_DIR/$CLAUDE_SCRIPT" "$INSTALL_DIR/$CLAUDE_BINARY"
     cp "$SCRIPT_DIR/$CODEX_SCRIPT" "$INSTALL_DIR/$CODEX_BINARY"
+    rm -rf "$INSTALL_DIR/$INSTALLED_LIB_DIR"
+    mkdir -p "$INSTALL_DIR/$INSTALLED_LIB_DIR"
+    cp "$SCRIPT_DIR/$LIB_DIR/"*.sh "$INSTALL_DIR/$INSTALLED_LIB_DIR/"
     chmod +x "$INSTALL_DIR/$CLAUDE_BINARY" "$INSTALL_DIR/$CODEX_BINARY"
 fi
 

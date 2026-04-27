@@ -82,10 +82,16 @@ chmod +x claude-ralph-loop/claude-ralph-loop.sh claude-ralph-loop/codex-ralph-lo
 sudo cp claude-ralph-loop/ralph-loop-core.sh /usr/local/bin/ralph-loop-core.sh
 sudo cp claude-ralph-loop/claude-ralph-loop.sh /usr/local/bin/claude-ralph-loop
 sudo cp claude-ralph-loop/codex-ralph-loop.sh /usr/local/bin/codex-ralph-loop
+sudo rm -rf /usr/local/bin/ralph-loop-lib
+sudo mkdir -p /usr/local/bin/ralph-loop-lib
+sudo cp claude-ralph-loop/lib/*.sh /usr/local/bin/ralph-loop-lib/
 # OR (user-only)
 cp claude-ralph-loop/ralph-loop-core.sh ~/bin/ralph-loop-core.sh
 cp claude-ralph-loop/claude-ralph-loop.sh ~/bin/claude-ralph-loop
 cp claude-ralph-loop/codex-ralph-loop.sh ~/bin/codex-ralph-loop
+rm -rf ~/bin/ralph-loop-lib
+mkdir -p ~/bin/ralph-loop-lib
+cp claude-ralph-loop/lib/*.sh ~/bin/ralph-loop-lib/
 ```
 
 ### Install Dependencies

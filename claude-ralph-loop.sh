@@ -17,6 +17,15 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
 CORE_PATH="$SCRIPT_DIR/ralph-loop-core.sh"
+if [[ -z "${RALPH_LIB_DIR:-}" ]]; then
+    if [[ -d "$SCRIPT_DIR/ralph-loop-lib" ]]; then
+        export RALPH_LIB_DIR="$SCRIPT_DIR/ralph-loop-lib"
+    else
+        export RALPH_LIB_DIR="$SCRIPT_DIR/lib"
+    fi
+else
+    export RALPH_LIB_DIR
+fi
 SNAPSHOT_PARENT="${RALPH_SCRIPT_SNAPSHOT_ROOT:-${TMPDIR:-/tmp}}"
 SNAPSHOT_DIR=""
 SNAPSHOT_CORE=""
