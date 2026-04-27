@@ -1415,7 +1415,7 @@ capture_review_findings_fingerprint() {
         | hash_stream
 }
 
-code_review_requires_dev() {
+run_code_review_gate() {
     local story_key="$1"
     local review_pass="$2"
     local previous_review_fingerprint="${3:-}"
@@ -1460,7 +1460,7 @@ code_review_requires_dev() {
     if [[ "$before_fingerprint" != "$after_fingerprint" ]]; then
         if [[ "$review_result" == "clean" ]]; then
             log WARN "Code review pass $review_pass reported clean but changed the worktree. Re-running dev-story."
-            return 0
+            return 1
         fi
 
         if [[ -z "$review_result" ]]; then
@@ -1468,12 +1468,12 @@ code_review_requires_dev() {
         else
             log WARN "Code review pass $review_pass requested another dev pass."
         fi
-        return 0
+        return 1
     fi
 
     if [[ "$review_result" == "changes-required" ]]; then
         log WARN "Code review pass $review_pass requested another dev pass."
-        return 0
+        return 1
     fi
 
     if [[ -z "$review_result" ]]; then
@@ -1482,7 +1482,7 @@ code_review_requires_dev() {
         log OK "Code review pass $review_pass finished cleanly."
     fi
 
-    return 1
+    return 0
 }
 
 verify_implementation() {
@@ -1947,7 +1947,7 @@ process_story() {
 
             review_pass="$next_review_pass"
             log STEP "[3/3] Running code review (pass $review_pass/$MAX_REVIEW_PASSES)..."
-            if code_review_requires_dev "$story_key" "$review_pass" "$previous_review_fingerprint" "$repeated_review_count"; then
+            if run_code_review_gate "$story_key" "$review_pass" "$previous_review_fingerprint" "$repeated_review_count"; then
                 review_outcome=0
             else
                 review_outcome=$?
@@ -1958,6 +1958,10 @@ process_story() {
 
             case "$review_outcome" in
                 0)
+                    update_story_status "$story_key" "done"
+                    current_status="done"
+                    ;;
+                1)
                     if [[ "$review_pass" -gt "$MAX_REVIEW_PASSES" ]]; then
                         log ERROR "Final verification review still requested another dev pass for $story_key after $MAX_REVIEW_PASSES completed review cycle(s)."
                         log ERROR "Inspect the latest review findings before continuing."
@@ -1966,10 +1970,6 @@ process_story() {
                     update_story_status "$story_key" "ready-for-dev"
                     current_status="ready-for-dev"
                     continue
-                    ;;
-                1)
-                    update_story_status "$story_key" "done"
-                    current_status="done"
                     ;;
                 3)
                     log ERROR "Aborting: repeated review findings indicate looped churn for $story_key"
