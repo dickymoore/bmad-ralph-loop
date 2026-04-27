@@ -17,18 +17,29 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$SOURCE_PATH")" && pwd)"
 CORE_PATH="$SCRIPT_DIR/ralph-loop-core.sh"
-SNAPSHOT_ROOT="${RALPH_SCRIPT_SNAPSHOT_ROOT:-${TMPDIR:-/tmp}/ralph-script-snapshots}"
+SNAPSHOT_PARENT="${RALPH_SCRIPT_SNAPSHOT_ROOT:-${TMPDIR:-/tmp}}"
+SNAPSHOT_DIR=""
 SNAPSHOT_CORE=""
 
 export PROVIDER="claude"
+
+cleanup_script_snapshot() {
+    if [[ -n "$SNAPSHOT_DIR" && -d "$SNAPSHOT_DIR" ]]; then
+        rm -rf "$SNAPSHOT_DIR"
+    fi
+}
 
 if [[ ! -f "$CORE_PATH" ]]; then
     echo "Error: ralph-loop-core.sh not found in $SCRIPT_DIR" >&2
     exit 1
 fi
 
-mkdir -p "$SNAPSHOT_ROOT"
-SNAPSHOT_CORE="$SNAPSHOT_ROOT/ralph-loop-core-$(date +%Y%m%d-%H%M%S)-$$.sh"
+mkdir -p "$SNAPSHOT_PARENT"
+SNAPSHOT_DIR="$(mktemp -d "$SNAPSHOT_PARENT/ralph-script-snapshot.XXXXXX")"
+chmod 700 "$SNAPSHOT_DIR"
+trap cleanup_script_snapshot EXIT
+
+SNAPSHOT_CORE="$SNAPSHOT_DIR/ralph-loop-core.sh"
 cp "$CORE_PATH" "$SNAPSHOT_CORE"
 chmod +x "$SNAPSHOT_CORE"
 
